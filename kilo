@@ -1,0 +1,373 @@
+-- ============================================================
+-- SECTION 1: analysis_rows_alerts — row-level deep dives
+-- Tables used: `PROJECT.DATASET.analysis_rows_alerts`
+-- ============================================================
+
+-- Query 1: Headline volumes & intersections per portfolio
+-- OUTPUT: One row per portfolio with totals, DSE/PROD alerts, BOTH/DSE-only/PROD-only,
+--         and their shares (% of all rows). Use this to gauge alignment vs mismatch.
+SELECT
+  portfolio_key,
+  COUNT(*)                                        AS rows_total,
+  SUM(DSE_ALERT)                                  AS dse_alerts,
+  SUM(PROD_ALERT)                                 AS prod_alerts,
+  SUM(BOTH_ALERT)                                 AS both_alerts,
+  SUM(DSE_ONLY_ALERT)                             AS dse_only_alerts,
+  SUM(PROD_ONLY_ALERT)                            AS prod_only_alerts,
+  SAFE_DIVIDE(SUM(BOTH_ALERT), COUNT(*))          AS pct_both_over_all,
+  SAFE_DIVIDE(SUM(DSE_ONLY_ALERT), COUNT(*))      AS pct_dse_only_over_all,
+  SAFE_DIVIDE(SUM(PROD_ONLY_ALERT), COUNT(*))     AS pct_prod_only_over_all
+FROM `PROJECT.DATASET.analysis_rows_alerts`
+GROUP BY portfolio_key
+ORDER BY rows_total DESC;
+
+-- Query 2: Margin distributions (how strong are alerts?) for DSE vs PROD
+-- OUTPUT: One row per portfolio with p10/p50/p90 for raw margins and p50 for MT margins,
+--         computed separately for DSE- and PROD-alerting rows. Higher p50/p90 = stronger alerts.
+WITH base AS (
+  SELECT * FROM `PROJECT.DATASET.analysis_rows_alerts`
+  WHERE DSE_ALERT=1 OR PROD_ALERT=1
+)
+SELECT
+  portfolio_key,
+  -- DSE
+  APPROX_QUANTILES(dse_raw_margin, 11)[OFFSET(1)] AS dse_raw_p10,
+  APPROX_QUANTILES(dse_raw_margin, 11)[OFFSET(5)] AS dse_raw_p50,
+  APPROX_QUANTILES(dse_raw_margin, 11)[OFFSET(9)] AS dse_raw_p90,
+  APPROX_QUANTILES(dse_mt_margin,  11)[OFFSET(5)] AS dse_mt_p50,
+  -- PROD
+  APPROX_QUANTILES(prod_raw_margin, 11)[OFFSET(1)] AS prod_raw_p10,
+  APPROX_QUANTILES(prod_raw_margin, 11)[OFFSET(5)] AS prod_raw_p50,
+  APPROX_QUANTILES(prod_raw_margin, 11)[OFFSET(9)] AS prod_raw_p90,
+  APPROX_QUANTILES(prod_mt_margin,  11)[OFFSET(5)] AS prod_mt_p50
+FROM base
+GROUP BY portfolio_key
+ORDER BY portfolio_key;
+
+-- Query 3: Are one-sided mismatches near threshold (likely tunable)?
+-- OUTPUT: One row per portfolio with counts of one-sided alerts where BOTH margins are within ±5.
+--         High counts here suggest tiny calibration/latency differences.
+SELECT
+  portfolio_key,
+  COUNTIF(DSE_ONLY_ALERT=1 AND ABS(dse_raw_margin) <= 5 AND ABS(dse_mt_margin) <= 5)  AS dse_only_near_threshold,
+  COUNTIF(PROD_ONLY_ALERT=1 AND ABS(prod_raw_margin) <= 5 AND ABS(prod_mt_margin) <= 5) AS prod_only_near_threshold
+FROM `PROJECT.DATASET.analysis_rows_alerts`
+GROUP BY portfolio_key
+ORDER BY portfolio_key;
+
+-- Query 4 (MATCH examples): Both environments alert
+-- OUTPUT: Sample rows showing BOTH alerts with thresholds, scores, margins, and fraud flag.
+--         Expect margins positive on both sides; use to illustrate "good alignment" cases.
+SELECT
+  portfolio_key,
+  th_raw_x1000, th_mt_x1000,
+  dse_raw_score_X1000, prod_raw_score_X1000,
+  dse_mt_score_X1000,  prod_mt_score_X1000,
+  dse_raw_margin, prod_raw_margin, dse_mt_margin, prod_mt_margin,
+  FLAG_FRAUD
+FROM `PROJECT.DATASET.analysis_rows_alerts`
+WHERE BOTH_ALERT=1
+ORDER BY RAND()
+LIMIT 25;
+
+-- Query 5 (MISMATCH examples): strongest DSE-only and PROD-only cases
+-- OUTPUT: Concrete rows where only one side alerts (sorted by largest positive margin on the alerting side).
+--         Use these as “show me” examples for stakeholders.
+(
+  SELECT
+    portfolio_key, 'DSE_ONLY' AS mismatch_type,
+    th_raw_x1000, th_mt_x1000,
+    dse_raw_score_X1000, prod_raw_score_X1000,
+    dse_mt_score_X1000,  prod_mt_score_X1000,
+    dse_raw_margin, prod_raw_margin, dse_mt_margin, prod_mt_margin,
+    FLAG_FRAUD,
+    GREATEST(dse_raw_margin, dse_mt_margin) AS max_margin
+  FROM `PROJECT.DATASET.analysis_rows_alerts`
+  WHERE DSE_ONLY_ALERT=1
+  ORDER BY max_margin DESC
+  LIMIT 20
+)
+UNION ALL
+(
+  SELECT
+    portfolio_key, 'PROD_ONLY' AS mismatch_type,
+    th_raw_x1000, th_mt_x1000,
+    dse_raw_score_X1000, prod_raw_score_X1000,
+    dse_mt_score_X1000,  prod_mt_score_X1000,
+    dse_raw_margin, prod_raw_margin, dse_mt_margin, prod_mt_margin,
+    FLAG_FRAUD,
+    GREATEST(prod_raw_margin, prod_mt_margin) AS max_margin
+  FROM `PROJECT.DATASET.analysis_rows_alerts`
+  WHERE PROD_ONLY_ALERT=1
+  ORDER BY max_margin DESC
+  LIMIT 20
+)
+ORDER BY mismatch_type, max_margin DESC;
+
+-- ============================================================
+-- SECTION 2: summary_by_portfolio — rates and portfolio stories
+-- Tables used: `PROJECT.DATASET.summary_by_portfolio`, analysis_rows_alerts for examples
+-- ============================================================
+
+-- Query 1: Convert counts to rates (alert rate, fraud-in-alert rate) for DSE vs PROD
+-- OUTPUT: One row per portfolio with normalized rates for fair comparison.
+WITH s AS (
+  SELECT * FROM `PROJECT.DATASET.summary_by_portfolio`
+)
+SELECT
+  portfolio,
+  rows_total,
+  dse_alert_count, prod_alert_count,
+  SAFE_DIVIDE(dse_alert_count, rows_total)   AS dse_alert_rate,
+  SAFE_DIVIDE(prod_alert_count, rows_total)  AS prod_alert_rate,
+  dse_fraud_in_alert, prod_fraud_in_alert,
+  SAFE_DIVIDE(dse_fraud_in_alert, dse_alert_count)   AS dse_fraud_in_alert_rate,
+  SAFE_DIVIDE(prod_fraud_in_alert, prod_alert_count) AS prod_fraud_in_alert_rate
+FROM s
+ORDER BY portfolio;
+
+-- Query 2: Best- and worst-aligned portfolios by combined gaps
+-- OUTPUT (best): portfolios with smallest combined gap (alert_rate + fraud_capture_rate)
+WITH s AS (
+  SELECT * FROM `PROJECT.DATASET.summary_by_portfolio`
+)
+SELECT
+  portfolio,
+  ABS(SAFE_DIVIDE(dse_alert_count, rows_total) - SAFE_DIVIDE(prod_alert_count, rows_total)) AS alert_rate_gap,
+  ABS(SAFE_DIVIDE(dse_fraud_in_alert, dse_alert_count) - SAFE_DIVIDE(prod_fraud_in_alert, prod_alert_count)) AS fraud_capture_gap
+FROM s
+ORDER BY (alert_rate_gap + fraud_capture_gap) ASC
+LIMIT 5;
+
+-- OUTPUT (worst): portfolios with largest combined gap
+WITH s AS (
+  SELECT * FROM `PROJECT.DATASET.summary_by_portfolio`
+)
+SELECT
+  portfolio,
+  ABS(SAFE_DIVIDE(dse_alert_count, rows_total) - SAFE_DIVIDE(prod_alert_count, rows_total)) AS alert_rate_gap,
+  ABS(SAFE_DIVIDE(dse_fraud_in_alert, dse_alert_count) - SAFE_DIVIDE(prod_fraud_in_alert, prod_alert_count)) AS fraud_capture_gap
+FROM s
+ORDER BY (alert_rate_gap + fraud_capture_gap) DESC
+LIMIT 5;
+
+-- Query 3: Example rows for a chosen portfolio (replace 'HSBC DIGITAL')
+-- OUTPUT: Tangible rows illustrating BOTH/DSE-only/PROD-only patterns in that portfolio.
+SELECT *
+FROM `PROJECT.DATASET.analysis_rows_alerts`
+WHERE portfolio_key = 'HSBC DIGITAL'
+  AND (BOTH_ALERT=1 OR DSE_ONLY_ALERT=1 OR PROD_ONLY_ALERT=1)
+ORDER BY BOTH_ALERT DESC, DSE_ONLY_ALERT DESC, PROD_ONLY_ALERT DESC
+LIMIT 50;
+
+
+-- ============================================================
+-- SECTION 3: summary_alert_overlap — alignment vs mismatch
+-- Tables used: `PROJECT.DATASET.summary_alert_overlap`, analysis_rows_alerts for examples
+-- ============================================================
+
+-- Query 1: Overlap snapshot + mismatch share
+-- OUTPUT: Share of BOTH/DSE-only/PROD-only over all rows, plus total mismatch share.
+SELECT
+  portfolio,
+  n,
+  both_alerts, dse_only, prod_only,
+  SAFE_DIVIDE(both_alerts, n)             AS pct_both_over_all,
+  SAFE_DIVIDE(dse_only, n)                AS pct_dse_only_over_all,
+  SAFE_DIVIDE(prod_only, n)               AS pct_prod_only_over_all,
+  SAFE_DIVIDE(dse_only + prod_only, n)    AS pct_mismatch
+FROM `PROJECT.DATASET.summary_alert_overlap`
+ORDER BY (CASE WHEN portfolio='__OVERALL__' THEN 0 ELSE 1 END), portfolio;
+
+-- Query 2: Top misaligned portfolios
+-- OUTPUT: Ports with highest one-sided share (where environments disagree most).
+SELECT
+  portfolio, n, dse_only, prod_only,
+  SAFE_DIVIDE(dse_only + prod_only, n) AS pct_mismatch
+FROM `PROJECT.DATASET.summary_alert_overlap`
+WHERE portfolio != '__OVERALL__'
+ORDER BY pct_mismatch DESC
+LIMIT 5;
+
+-- Query 3: Concrete examples for a chosen portfolio (replace 'FD DIGITAL')
+-- OUTPUT: Real rows showing the pattern (BOTH vs one-sided) for storytelling.
+SELECT
+  portfolio_key,
+  th_raw_x1000, th_mt_x1000,
+  dse_raw_score_X1000, prod_raw_score_X1000,
+  dse_mt_score_X1000,  prod_mt_score_X1000,
+  dse_raw_margin, prod_raw_margin, dse_mt_margin, prod_mt_margin,
+  DSE_ALERT, PROD_ALERT, BOTH_ALERT, DSE_ONLY_ALERT, PROD_ONLY_ALERT,
+  FLAG_FRAUD
+FROM `PROJECT.DATASET.analysis_rows_alerts`
+WHERE portfolio_key = 'FD DIGITAL'
+  AND (BOTH_ALERT=1 OR DSE_ONLY_ALERT=1 OR PROD_ONLY_ALERT=1)
+ORDER BY DSE_ONLY_ALERT DESC, PROD_ONLY_ALERT DESC, BOTH_ALERT DESC
+LIMIT 50;
+
+
+-- ============================================================
+-- SECTION 4: summary_fraud_in_alerts — fraud concentration
+-- Tables used: `PROJECT.DATASET.summary_fraud_in_alerts`, analysis_rows_alerts for examples
+-- ============================================================
+
+-- Query 1: Fraud concentration among alerted rows
+-- OUTPUT: For each portfolio (and overall), where fraud is found: BOTH, DSE-only, PROD-only.
+SELECT
+  portfolio,
+  alerted_rows,
+  fraud_both, fraud_dse_only, fraud_prod_only,
+  pct_fraud_both_over_alerted,
+  pct_fraud_dse_only_over_alerted,
+  pct_fraud_prod_only_over_alerted
+FROM `PROJECT.DATASET.summary_fraud_in_alerts`
+ORDER BY (CASE WHEN portfolio='__OVERALL__' THEN 0 ELSE 1 END), portfolio;
+
+-- Query 2: Where one side uniquely catches fraud (impactful mismatches)
+-- OUTPUT: Ports where one-sided fraud share is largest (costly disagreement).
+SELECT
+  portfolio,
+  alerted_rows,
+  pct_fraud_dse_only_over_alerted,
+  pct_fraud_prod_only_over_alerted,
+  GREATEST(pct_fraud_dse_only_over_alerted, pct_fraud_prod_only_over_alerted) AS pct_fraud_unique_peak
+FROM `PROJECT.DATASET.summary_fraud_in_alerts`
+WHERE portfolio != '__OVERALL__'
+ORDER BY pct_fraud_unique_peak DESC
+LIMIT 5;
+
+-- Query 3a: DSE-only fraud examples
+-- OUTPUT: Example rows where only DSE alerted and fraud=1; use to inspect score gaps.
+SELECT
+  portfolio_key, FLAG_FRAUD,
+  th_raw_x1000, th_mt_x1000,
+  dse_raw_score_X1000, prod_raw_score_X1000,
+  dse_mt_score_X1000,  prod_mt_score_X1000,
+  dse_raw_margin, prod_raw_margin, dse_mt_margin, prod_mt_margin
+FROM `PROJECT.DATASET.analysis_rows_alerts`
+WHERE DSE_ONLY_ALERT=1 AND FLAG_FRAUD=1
+ORDER BY GREATEST(dse_raw_margin, dse_mt_margin) DESC
+LIMIT 25;
+
+-- Query 3b: PROD-only fraud examples
+-- OUTPUT: Example rows where only PROD alerted and fraud=1.
+SELECT
+  portfolio_key, FLAG_FRAUD,
+  th_raw_x1000, th_mt_x1000,
+  dse_raw_score_X1000, prod_raw_score_X1000,
+  dse_mt_score_X1000,  prod_mt_score_X1000,
+  dse_raw_margin, prod_raw_margin, dse_mt_margin, prod_mt_margin
+FROM `PROJECT.DATASET.analysis_rows_alerts`
+WHERE PROD_ONLY_ALERT=1 AND FLAG_FRAUD=1
+ORDER BY GREATEST(prod_raw_margin, prod_mt_margin) DESC
+LIMIT 25;
+
+
+
+-- ============================================================
+-- SECTION 5: diagnostics_mismatch — magnitude of differences
+-- Tables used: `PROJECT.DATASET.diagnostics_mismatch`, analysis_rows_alerts for examples
+-- ============================================================
+
+-- Query 1: Medians (p50) and tails (p90) for one-sided cases
+-- OUTPUT: One row per portfolio with margin-above (alerting side) and deficit-below (non-alerting side).
+--         Small p50/p90 = near-threshold (tunable). Large p90 = structural differences.
+SELECT
+  portfolio,
+  -- medians
+  dse_only_margin_p50,  dse_only_deficit_p50,
+  prod_only_margin_p50, prod_only_deficit_p50,
+  -- tails
+  dse_only_margin_p90,  dse_only_deficit_p90,
+  prod_only_margin_p90, prod_only_deficit_p90
+FROM `PROJECT.DATASET.diagnostics_mismatch`
+ORDER BY (dse_only_deficit_p90 + prod_only_deficit_p90) DESC;
+
+-- Query 2a: Pull worst DSE-only offenders (PROD far below threshold)
+-- OUTPUT: Rows where DSE alerted but PROD is most below its thresholds.
+SELECT *
+FROM `PROJECT.DATASET.analysis_rows_alerts`
+WHERE DSE_ONLY_ALERT=1
+ORDER BY GREATEST(th_raw_x1000 - prod_raw_score_X1000,
+                  th_mt_x1000  - prod_mt_score_X1000) DESC
+LIMIT 25;
+
+-- Query 2b: Pull worst PROD-only offenders (DSE far below threshold)
+-- OUTPUT: Rows where PROD alerted but DSE is most below its thresholds.
+SELECT *
+FROM `PROJECT.DATASET.analysis_rows_alerts`
+WHERE PROD_ONLY_ALERT=1
+ORDER BY GREATEST(th_raw_x1000 - dse_raw_score_X1000,
+                  th_mt_x1000  - dse_mt_score_X1000) DESC
+LIMIT 25;
+
+-- Query 3: Near-threshold one-sided (likely tunable pockets)
+-- OUTPUT: Counts of one-sided alerts where both margins are within ±5.
+SELECT
+  portfolio_key,
+  COUNTIF(DSE_ONLY_ALERT=1  AND ABS(dse_raw_margin)  <= 5 AND ABS(dse_mt_margin)  <= 5) AS dse_only_near_thresh,
+  COUNTIF(PROD_ONLY_ALERT=1 AND ABS(prod_raw_margin) <= 5 AND ABS(prod_mt_margin) <= 5) AS prod_only_near_thresh
+FROM `PROJECT.DATASET.analysis_rows_alerts`
+GROUP BY portfolio_key
+ORDER BY portfolio_key;
+
+
+
+-- ============================================================
+-- SECTION 6: hourly_distribution — temporal patterns
+-- Tables used: `PROJECT.DATASET.hourly_distribution`
+-- ============================================================
+
+-- Query 1: One-sided spikes by hour (overall)
+-- OUTPUT: Which hours see the highest DSE-only / PROD-only volumes (un-normalized).
+SELECT
+  hour_of_day_local,
+  SUM(dse_only_rows)  AS dse_only_rows,
+  SUM(prod_only_rows) AS prod_only_rows
+FROM `PROJECT.DATASET.hourly_distribution`
+GROUP BY hour_of_day_local
+ORDER BY dse_only_rows DESC, prod_only_rows DESC
+LIMIT 12;
+
+-- Query 2: Normalized mismatch share by hour & portfolio
+-- OUTPUT: Hours where mismatches dominate (one-sided / total), not just where traffic is high.
+SELECT
+  portfolio,
+  hour_of_day_local,
+  SAFE_DIVIDE(dse_only_rows + prod_only_rows, NULLIF(rows_total,0)) AS pct_mismatch_hour
+FROM `PROJECT.DATASET.hourly_distribution`
+ORDER BY pct_mismatch_hour DESC
+LIMIT 20;
+
+-- Query 3: Fraud concentrated in one-sided alerts by hour
+-- OUTPUT: Hours where one-sided disagreements contain disproportionate fraud.
+SELECT
+  portfolio,
+  hour_of_day_local,
+  SAFE_DIVIDE(fraud_in_dse_only + fraud_in_prod_only, NULLIF(rows_total,0)) AS pct_fraud_in_one_sided
+FROM `PROJECT.DATASET.hourly_distribution`
+ORDER BY pct_fraud_in_one_sided DESC
+LIMIT 20;
+
+-- Query 4a: MATCH hours (high BOTH share)
+-- OUTPUT: Hours with highest BOTH_ALERT share (healthy alignment windows).
+SELECT
+  portfolio, hour_of_day_local,
+  both_alert_rows, rows_total,
+  SAFE_DIVIDE(both_alert_rows, NULLIF(rows_total,0)) AS pct_both
+FROM `PROJECT.DATASET.hourly_distribution`
+ORDER BY pct_both DESC
+LIMIT 10;
+
+-- Query 4b: MISMATCH hours (high one-sided share)
+-- OUTPUT: Hours where DSE-only + PROD-only dominate (risky windows).
+SELECT
+  portfolio, hour_of_day_local,
+  dse_only_rows, prod_only_rows, rows_total,
+  SAFE_DIVIDE(dse_only_rows + prod_only_rows, NULLIF(rows_total,0)) AS pct_one_sided
+FROM `PROJECT.DATASET.hourly_distribution`
+ORDER BY pct_one_sided DESC
+LIMIT 10;
+
+
+
