@@ -1,0 +1,18 @@
+SELECT
+  portfolio_key,
+  SUM(DSE_ALERT)              AS dse_alerts,
+  SUM(PROD_ALERT)             AS prod_alerts,
+  SUM(BOTH_ALERT)             AS both_alerts,
+  SUM(DSE_ONLY_ALERT)         AS dse_only_alerts,
+  SUM(PROD_ONLY_ALERT)        AS prod_only_alerts,
+  -- New denominator: all rows where at least one alert fired
+  (SUM(BOTH_ALERT) + SUM(DSE_ONLY_ALERT) + SUM(PROD_ONLY_ALERT)) AS total_alerted,
+  SAFE_DIVIDE(SUM(BOTH_ALERT),
+              (SUM(BOTH_ALERT) + SUM(DSE_ONLY_ALERT) + SUM(PROD_ONLY_ALERT))) AS pct_both_over_alerted,
+  SAFE_DIVIDE(SUM(DSE_ONLY_ALERT),
+              (SUM(BOTH_ALERT) + SUM(DSE_ONLY_ALERT) + SUM(PROD_ONLY_ALERT))) AS pct_dse_only_over_alerted,
+  SAFE_DIVIDE(SUM(PROD_ONLY_ALERT),
+              (SUM(BOTH_ALERT) + SUM(DSE_ONLY_ALERT) + SUM(PROD_ONLY_ALERT))) AS pct_prod_only_over_alerted
+FROM `PROJECT.DATASET.analysis_rows_alerts`
+GROUP BY portfolio_key
+ORDER BY portfolio_key;
