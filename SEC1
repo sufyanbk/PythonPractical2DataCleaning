@@ -1,0 +1,37 @@
+
+-- MATCH: both alert → show scores, thresholds, margins
+SELECT portfolio_key,
+       dse_raw_score_X1000, prod_raw_score_X1000, th_raw_x1000,
+       dse_mt_score_X1000,  prod_mt_score_X1000,  th_mt_x1000,
+       dse_raw_margin, prod_raw_margin, dse_mt_margin, prod_mt_margin,
+       FLAG_FRAUD
+FROM `PROJECT.DATASET.analysis_rows_alerts`
+WHERE BOTH_ALERT=1
+LIMIT 20;
+
+-- MISMATCH: DSE-only vs PROD-only, sorted by biggest disagreement
+SELECT * FROM (
+  SELECT
+    portfolio_key, 'DSE_ONLY' AS mismatch_type,
+    dse_raw_score_X1000, prod_raw_score_X1000, th_raw_x1000,
+    dse_mt_score_X1000,  prod_mt_score_X1000,  th_mt_x1000,
+    dse_raw_margin, prod_raw_margin, dse_mt_margin, prod_mt_margin,
+    FLAG_FRAUD,
+    GREATEST(dse_raw_margin, dse_mt_margin) AS max_margin
+  FROM `PROJECT.DATASET.analysis_rows_alerts`
+  WHERE DSE_ONLY_ALERT=1
+
+  UNION ALL
+
+  SELECT
+    portfolio_key, 'PROD_ONLY' AS mismatch_type,
+    dse_raw_score_X1000, prod_raw_score_X1000, th_raw_x1000,
+    dse_mt_score_X1000,  prod_mt_score_X1000,  th_mt_x1000,
+    dse_raw_margin, prod_raw_margin, dse_mt_margin, prod_mt_margin,
+    FLAG_FRAUD,
+    GREATEST(prod_raw_margin, prod_mt_margin) AS max_margin
+  FROM `PROJECT.DATASET.analysis_rows_alerts`
+  WHERE PROD_ONLY_ALERT=1
+)
+ORDER BY max_margin DESC
+LIMIT 20;
