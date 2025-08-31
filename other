@@ -1,242 +1,93 @@
--- ======================================================================
--- CHANNEL SNAPSHOT (replicates your screenshot layout)
--- Uses: PROJECT.DATASET.analysis_rows_alerts
--- Money column: tbt_tran_amt (cast to NUMERIC)
--- What you'll get:
---   • Two rows per Channel (portfolio_key): one PROD, one DSE
---   • Alerts, symmetric ∩ Alert % (Jaccard), Fraud count, £ Fraud, symmetric ∩ Fraud %
---   • Sorts by Channel, Env
--- ======================================================================
+-- ================================================================
+-- CHANNEL × HOUR (0–23) MATRIX — aggregated across all days
+-- Creates a readable dataset for dashboards/CSV: one row per
+-- Channel and Hour-of-day with alerts, intersections, and fraud.
+-- ================================================================
 
--- 1) Base with clean money
-WITH base AS (
-  SELECT
-    portfolio_key AS channel,
-    DSE_ALERT, PROD_ALERT, BOTH_ALERT, DSE_ONLY_ALERT, PROD_ONLY_ALERT,
-    FLAG_FRAUD,
-    SAFE_CAST(tbt_tran_amt AS NUMERIC) AS amount_gbp
-  FROM `PROJECT.DATASET.analysis_rows_alerts`
-),
+CREATE OR REPLACE VIEW `PROJECT.DATASET.channel_hourly_matrix` AS
+WITH
+  -- 0..23 hour spine to ensure every hour appears
+  hours AS (
+    SELECT hour FROM UNNEST(GENERATE_ARRAY(0, 23)) AS hour
+  ),
 
--- 2) One aggregate per channel
-agg AS (
-  SELECT
-    channel,
-
-    -- Alerts
-    SUM(PROD_ALERT) AS prod_alerts,
-    SUM(DSE_ALERT)  AS dse_alerts,
-    SUM(BOTH_ALERT) AS both_alerts,
-
-    -- Fraud-in-alert (counts)
-    SUM(CASE WHEN PROD_ALERT=1 AND FLAG_FRAUD=1 THEN 1 ELSE 0 END) AS prod_fraud_cnt,
-    SUM(CASE WHEN DSE_ALERT =1 AND FLAG_FRAUD=1 THEN 1 ELSE 0 END) AS dse_fraud_cnt,
-    SUM(CASE WHEN BOTH_ALERT=1 AND FLAG_FRAUD=1 THEN 1 ELSE 0 END) AS both_fraud_cnt,
-
-    -- Fraud-in-alert (values £)
-    SUM(CASE WHEN PROD_ALERT=1 AND FLAG_FRAUD=1 THEN amount_gbp ELSE 0 END) AS prod_fraud_val_gbp,
-    SUM(CASE WHEN DSE_ALERT =1 AND FLAG_FRAUD=1 THEN amount_gbp ELSE 0 END) AS dse_fraud_val_gbp,
-    SUM(CASE WHEN BOTH_ALERT=1 AND FLAG_FRAUD=1 THEN amount_gbp ELSE 0 END) AS both_fraud_val_gbp
-  FROM base
-  GROUP BY channel
-),
-
--- 3) Symmetric intersections (Jaccard) so % is identical on PROD/DSE rows
-jacc AS (
-  SELECT
-    channel,
-    SAFE_DIVIDE(both_alerts, (prod_alerts + dse_alerts - both_alerts))                     AS j_alert,
-    SAFE_DIVIDE(both_fraud_cnt, (prod_fraud_cnt + dse_fraud_cnt - both_fraud_cnt))         AS j_fraud
-  FROM agg
-)
-
--- 4) Final two-row-per-channel output
-SELECT
-  a.channel                                   AS Channel,
-  'PROD'                                      AS Env,
-  a.prod_alerts                               AS Alerts,
-  j.j_alert                                   AS Intersect_Alert_Pct,     -- ∩ Alert %
-  a.prod_fraud_cnt                            AS Fraud_Count,             -- # Fraud (in PROD alerts)
-  a.prod_fraud_val_gbp                        AS Fraud_Value_GBP,         -- £ Fraud (numeric; format in BI)
-  j.j_fraud                                   AS Intersect_Fraud_Pct      -- ∩ Fraud %
-FROM agg a
-JOIN jacc j USING (channel)
-
-UNION ALL
-SELECT
-  a.channel                                   AS Channel,
-  'DSE'                                       AS Env,
-  a.dse_alerts                                AS Alerts,
-  j.j_alert                                   AS Intersect_Alert_Pct,
-  a.dse_fraud_cnt                             AS Fraud_Count,
-  a.dse_fraud_val_gbp                         AS Fraud_Value_GBP,
-  j.j_fraud                                   AS Intersect_Fraud_Pct
-FROM agg a
-JOIN jacc j USING (channel)
-ORDER BY Channel, Env;
-
-
-
-
--- MATCHES: BOTH alert — top 10 strongest by combined margins
-SELECT
-  portfolio_key AS channel,
-  th_raw_x1000, th_mt_x1000,
-  dse_raw_score_X1000, prod_raw_score_X1000,
-  dse_mt_score_X1000,  prod_mt_score_X1000,
-  dse_raw_margin, prod_raw_margin, dse_mt_margin, prod_mt_margin,
-  FLAG_FRAUD,
-  SAFE_CAST(tbt_tran_amt AS NUMERIC) AS amount_gbp
-FROM `PROJECT.DATASET.analysis_rows_alerts`
-WHERE BOTH_ALERT=1
-ORDER BY (dse_raw_margin + prod_raw_margin + dse_mt_margin + prod_mt_margin) DESC
-LIMIT 10;
-
--- MISMATCHES: DSE-only — top 10 by DSE margin
-SELECT
-  portfolio_key AS channel,
-  th_raw_x1000, th_mt_x1000,
-  dse_raw_score_X1000, prod_raw_score_X1000,
-  dse_mt_score_X1000,  prod_mt_score_X1000,
-  dse_raw_margin, prod_raw_margin, dse_mt_margin, prod_mt_margin,
-  FLAG_FRAUD,
-  SAFE_CAST(tbt_tran_amt AS NUMERIC) AS amount_gbp
-FROM `PROJECT.DATASET.analysis_rows_alerts`
-WHERE DSE_ONLY_ALERT=1
-ORDER BY GREATEST(dse_raw_margin, dse_mt_margin) DESC
-LIMIT 10;
-
--- MISMATCHES: PROD-only — top 10 by PROD margin
-SELECT
-  portfolio_key AS channel,
-  th_raw_x1000, th_mt_x1000,
-  dse_raw_score_X1000, prod_raw_score_X1000,
-  dse_mt_score_X1000,  prod_mt_score_X1000,
-  dse_raw_margin, prod_raw_margin, dse_mt_margin, prod_mt_margin,
-  FLAG_FRAUD,
-  SAFE_CAST(tbt_tran_amt AS NUMERIC) AS amount_gbp
-FROM `PROJECT.DATASET.analysis_rows_alerts`
-WHERE PROD_ONLY_ALERT=1
-ORDER BY GREATEST(prod_raw_margin, prod_mt_margin) DESC
-LIMIT 10;
-
-
-
-
--- ======================================================================
--- TIME DISTRIBUTION: per Channel × Date × Hour
--- Uses: PROJECT.DATASET.analysis_rows_alerts
--- Money column: tbt_tran_amt (cast to NUMERIC)
--- What you'll get per slice:
---   • dse/prod alerts, both alerts, one-sided alerts
---   • Jaccard ∩ Alert % and ∩ Fraud % for the slice
---   • Fraud counts & £ by env
--- ======================================================================
-
-WITH base AS (
-  SELECT
-    portfolio_key AS channel,
-    DSE_ALERT, PROD_ALERT, BOTH_ALERT, DSE_ONLY_ALERT, PROD_ONLY_ALERT,
-    FLAG_FRAUD,
-    SAFE_CAST(tbt_tran_amt AS NUMERIC) AS amount_gbp,
-    DATE(TIMESTAMP_MILLIS(event_received_at)) AS event_date,
-    EXTRACT(HOUR FROM TIMESTAMP_MILLIS(event_received_at)) AS event_hour
-  FROM `PROJECT.DATASET.analysis_rows_alerts`
-),
-
-slice AS (
-  SELECT
-    channel, event_date, event_hour,
-
-    -- Alerts
-    SUM(DSE_ALERT)  AS dse_alerts,
-    SUM(PROD_ALERT) AS prod_alerts,
-    SUM(BOTH_ALERT) AS both_alerts,
-    SUM(DSE_ONLY_ALERT) AS dse_only_alerts,
-    SUM(PROD_ONLY_ALERT) AS prod_only_alerts,
-
-    -- Fraud-in-alert (counts & £)
-    SUM(CASE WHEN DSE_ALERT =1 AND FLAG_FRAUD=1 THEN 1 ELSE 0 END) AS dse_fraud_cnt,
-    SUM(CASE WHEN PROD_ALERT=1 AND FLAG_FRAUD=1 THEN 1 ELSE 0 END) AS prod_fraud_cnt,
-    SUM(CASE WHEN BOTH_ALERT=1 AND FLAG_FRAUD=1 THEN 1 ELSE 0 END) AS both_fraud_cnt,
-    SUM(CASE WHEN DSE_ALERT =1 AND FLAG_FRAUD=1 THEN amount_gbp ELSE 0 END) AS dse_fraud_val_gbp,
-    SUM(CASE WHEN PROD_ALERT=1 AND FLAG_FRAUD=1 THEN amount_gbp ELSE 0 END) AS prod_fraud_val_gbp
-  FROM base
-  GROUP BY channel, event_date, event_hour
-)
-
-SELECT
-  channel,
-  event_date,
-  event_hour,
-
-  -- Volumes
-  dse_alerts, prod_alerts, both_alerts,
-  dse_only_alerts, prod_only_alerts,
-
-  -- Symmetric intersections for the slice
-  SAFE_DIVIDE(both_alerts, (dse_alerts + prod_alerts - both_alerts)) AS j_alert_slice,   -- ∩ Alert %
-  SAFE_DIVIDE(both_fraud_cnt, (dse_fraud_cnt + prod_fraud_cnt - both_fraud_cnt)) AS j_fraud_slice, -- ∩ Fraud %
-
-  -- Fraud volumes
-  dse_fraud_cnt, prod_fraud_cnt, both_fraud_cnt,
-  dse_fraud_val_gbp, prod_fraud_val_gbp
-FROM slice
-ORDER BY channel, event_date, event_hour;
-
-
-
--- Biggest one-sided windows (where disagreements dominate)
-WITH h AS (
-  SELECT
-    channel, event_date, event_hour,
-    dse_alerts, prod_alerts, both_alerts,
-    (dse_only_alerts + prod_only_alerts) AS one_sided
-  FROM (
+  -- Base rows with clean money and hour extracted from ms-string
+  base AS (
     SELECT
-      channel, event_date, event_hour,
-      SUM(DSE_ALERT) dse_alerts, SUM(PROD_ALERT) prod_alerts, SUM(BOTH_ALERT) both_alerts,
-      SUM(DSE_ONLY_ALERT) dse_only_alerts, SUM(PROD_ONLY_ALERT) prod_only_alerts
-    FROM (
-      SELECT
-        portfolio_key AS channel,
-        DSE_ALERT, PROD_ALERT, BOTH_ALERT, DSE_ONLY_ALERT, PROD_ONLY_ALERT,
-        DATE(TIMESTAMP_MILLIS(event_received_at)) AS event_date,
-        EXTRACT(HOUR FROM TIMESTAMP_MILLIS(event_received_at)) AS event_hour
-      FROM `PROJECT.DATASET.analysis_rows_alerts`
-    )
-    GROUP BY channel, event_date, event_hour
-  )
-)
-SELECT
-  channel, event_date, event_hour,
-  one_sided,
-  SAFE_DIVIDE(one_sided, NULLIF(dse_alerts + prod_alerts - both_alerts,0)) AS pct_one_sided
-FROM h
-ORDER BY pct_one_sided DESC, one_sided DESC
-LIMIT 10;
+      portfolio_key AS channel,
+      EXTRACT(HOUR FROM TIMESTAMP_MILLIS(CAST(event_received_at AS INT64))) AS event_hour,
+      DSE_ALERT, PROD_ALERT, BOTH_ALERT, DSE_ONLY_ALERT, PROD_ONLY_ALERT,
+      FLAG_FRAUD,
+      SAFE_CAST(tbt_tran_amt AS NUMERIC) AS amount_gbp
+    FROM `PROJECT.DATASET.analysis_rows_alerts`
+  ),
 
--- Windows where one-sided alerts contain the most fraud (by count)
-WITH b AS (
-  SELECT
-    portfolio_key AS channel,
-    DATE(TIMESTAMP_MILLIS(event_received_at)) AS event_date,
-    EXTRACT(HOUR FROM TIMESTAMP_MILLIS(event_received_at)) AS event_hour,
-    DSE_ONLY_ALERT, PROD_ONLY_ALERT, FLAG_FRAUD
-  FROM `PROJECT.DATASET.analysis_rows_alerts`
-),
-g AS (
-  SELECT
-    channel, event_date, event_hour,
-    SUM(CASE WHEN DSE_ONLY_ALERT=1  AND FLAG_FRAUD=1 THEN 1 ELSE 0 END) AS fraud_in_dse_only,
-    SUM(CASE WHEN PROD_ONLY_ALERT=1 AND FLAG_FRAUD=1 THEN 1 ELSE 0 END) AS fraud_in_prod_only
-  FROM b
-  GROUP BY channel, event_date, event_hour
-)
+  -- Distinct channels to cross with hour spine (ensures 24 rows/channel)
+  channels AS (
+    SELECT DISTINCT channel FROM base
+  ),
+
+  -- Aggregate across ALL days by Channel × Hour
+  agg AS (
+    SELECT
+      channel,
+      event_hour,
+
+      -- Alerts
+      SUM(DSE_ALERT)  AS dse_alerts,
+      SUM(PROD_ALERT) AS prod_alerts,
+      SUM(BOTH_ALERT) AS intersect_alerts,     -- = both_alerts
+      SUM(DSE_ONLY_ALERT) AS dse_only_alerts,
+      SUM(PROD_ONLY_ALERT) AS prod_only_alerts,
+
+      -- Fraud-in-alert (counts)
+      SUM(CASE WHEN DSE_ALERT =1 AND FLAG_FRAUD=1 THEN 1 ELSE 0 END) AS dse_fraud_cnt,
+      SUM(CASE WHEN PROD_ALERT=1 AND FLAG_FRAUD=1 THEN 1 ELSE 0 END) AS prod_fraud_cnt,
+      SUM(CASE WHEN BOTH_ALERT=1 AND FLAG_FRAUD=1 THEN 1 ELSE 0 END) AS intersect_fraud_cnt,
+
+      -- Fraud-in-alert (values, £)
+      SUM(CASE WHEN DSE_ALERT =1 AND FLAG_FRAUD=1 THEN amount_gbp ELSE 0 END) AS dse_fraud_val_gbp,
+      SUM(CASE WHEN PROD_ALERT=1 AND FLAG_FRAUD=1 THEN amount_gbp ELSE 0 END) AS prod_fraud_val_gbp
+    FROM base
+    GROUP BY channel, event_hour
+  )
+
+-- Final matrix: 24 rows per channel, zeros when no data in that hour
 SELECT
-  channel, event_date, event_hour,
-  fraud_in_dse_only, fraud_in_prod_only,
-  (fraud_in_dse_only + fraud_in_prod_only) AS fraud_in_one_sided
-FROM g
-ORDER BY fraud_in_one_sided DESC
-LIMIT 10;
+  c.channel,
+  h.hour AS event_hour,
+
+  -- Alert volumes
+  COALESCE(a.dse_alerts, 0)          AS dse_alerts,
+  COALESCE(a.prod_alerts, 0)         AS prod_alerts,
+  COALESCE(a.intersect_alerts, 0)    AS intersect_alerts,        -- |DSE ∩ PROD|
+  COALESCE(a.dse_only_alerts, 0)     AS dse_only_alerts,
+  COALESCE(a.prod_only_alerts, 0)    AS prod_only_alerts,
+
+  -- Symmetric intersection % (Jaccard) for alerts
+  SAFE_DIVIDE(
+    COALESCE(a.intersect_alerts, 0),
+    NULLIF(COALESCE(a.dse_alerts, 0) + COALESCE(a.prod_alerts, 0) - COALESCE(a.intersect_alerts, 0), 0)
+  ) AS intersect_alert_pct,                                           -- |∩| / |∪|
+
+  -- Fraud (counts)
+  COALESCE(a.dse_fraud_cnt, 0)       AS dse_fraud_cnt,
+  COALESCE(a.prod_fraud_cnt, 0)      AS prod_fraud_cnt,
+  COALESCE(a.intersect_fraud_cnt, 0) AS intersect_fraud_cnt,         -- fraud caught by BOTH
+
+  -- Symmetric intersection % for fraud-in-alert (counts)
+  SAFE_DIVIDE(
+    COALESCE(a.intersect_fraud_cnt, 0),
+    NULLIF(COALESCE(a.dse_fraud_cnt, 0) + COALESCE(a.prod_fraud_cnt, 0) - COALESCE(a.intersect_fraud_cnt, 0), 0)
+  ) AS intersect_fraud_pct,                                          -- |∩ fraud| / |∪ fraud|
+
+  -- Fraud (values £)
+  COALESCE(a.dse_fraud_val_gbp, 0)   AS dse_fraud_val_gbp,
+  COALESCE(a.prod_fraud_val_gbp, 0)  AS prod_fraud_val_gbp
+
+FROM channels c
+CROSS JOIN hours h
+LEFT JOIN agg a
+  ON a.channel = c.channel
+ AND a.event_hour = h.hour
+ORDER BY c.channel, event_hour;
