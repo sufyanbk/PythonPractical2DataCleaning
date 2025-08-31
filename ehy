@@ -1,0 +1,91 @@
+-- ======================================================================
+-- CHANNEL SNAPSHOT (txn-level, deduped by lifecycle_id)
+-- Replicates the screenshot layout but fixes low intersection due to duplicates.
+-- Uses: PROJECT.DATASET.analysis_rows_alerts
+-- Money column: tbt_tran_amt
+-- Unique transaction key: lifecycle_id  (change if yours is different)
+-- Output: two rows per Channel (Env=PROD/DSE) + symmetric intersection %.
+-- ======================================================================
+
+-- 0) Bring only the fields we need
+WITH base AS (
+  SELECT
+    portfolio_key AS channel,
+    lifecycle_id,
+    DSE_ALERT, PROD_ALERT,
+    FLAG_FRAUD,
+    SAFE_CAST(tbt_tran_amt AS NUMERIC) AS amount_gbp
+  FROM `PROJECT.DATASET.analysis_rows_alerts`
+),
+
+-- 1) Collapse to one record per transaction (handle duplicate rows)
+--    MAX(0/1) keeps the "did this env alert?" truth; MAX(amount) avoids double-counting £
+tx AS (
+  SELECT
+    channel,
+    lifecycle_id,
+    MAX(DSE_ALERT)  AS dse,         -- 0/1 at txn grain
+    MAX(PROD_ALERT) AS prod,        -- 0/1 at txn grain
+    MAX(FLAG_FRAUD) AS fraud,       -- 0/1 at txn grain
+    MAX(amount_gbp) AS amount_tx_gbp
+  FROM base
+  GROUP BY channel, lifecycle_id
+),
+
+-- 2) Aggregate once per channel at transaction grain
+agg AS (
+  SELECT
+    channel,
+
+    -- Alerts (counts of txns)
+    SUM(prod) AS prod_alerts,
+    SUM(dse)  AS dse_alerts,
+    SUM(CASE WHEN dse=1 AND prod=1 THEN 1 ELSE 0 END) AS both_alerts,
+    SUM(CASE WHEN dse=1 AND prod=0 THEN 1 ELSE 0 END) AS dse_only_alerts,
+    SUM(CASE WHEN dse=0 AND prod=1 THEN 1 ELSE 0 END) AS prod_only_alerts,
+
+    -- Fraud-in-alert (counts of txns)
+    SUM(CASE WHEN prod=1 AND fraud=1 THEN 1 ELSE 0 END) AS prod_fraud_cnt,
+    SUM(CASE WHEN dse =1 AND fraud=1 THEN 1 ELSE 0 END) AS dse_fraud_cnt,
+    SUM(CASE WHEN dse =1 AND prod=1 AND fraud=1 THEN 1 ELSE 0 END) AS both_fraud_cnt,
+
+    -- Fraud-in-alert (values £ at txn grain; avoids double counting)
+    SUM(CASE WHEN prod=1 AND fraud=1 THEN amount_tx_gbp ELSE 0 END) AS prod_fraud_val_gbp,
+    SUM(CASE WHEN dse =1 AND fraud=1 THEN amount_tx_gbp ELSE 0 END) AS dse_fraud_val_gbp
+  FROM tx
+  GROUP BY channel
+),
+
+-- 3) Symmetric intersections (Jaccard) — one value per channel
+jacc AS (
+  SELECT
+    channel,
+    SAFE_DIVIDE(both_alerts, (prod_alerts + dse_alerts - both_alerts))                 AS j_alert,
+    SAFE_DIVIDE(both_fraud_cnt, (prod_fraud_cnt + dse_fraud_cnt - both_fraud_cnt))     AS j_fraud
+  FROM agg
+)
+
+-- 4) Final two-row-per-channel table (same number repeated for both envs)
+SELECT
+  a.channel                                   AS Channel,
+  'PROD'                                      AS Env,
+  a.prod_alerts                                AS Alerts,
+  j.j_alert                                    AS Intersect_Alert_Pct,     -- ∩ Alert %
+  a.prod_fraud_cnt                             AS Fraud_Count,             -- # Fraud (in PROD alerts)
+  a.prod_fraud_val_gbp                         AS Fraud_Value_GBP,         -- £ Fraud (numeric)
+  j.j_fraud                                    AS Intersect_Fraud_Pct      -- ∩ Fraud %
+FROM agg a
+JOIN jacc j USING (channel)
+
+UNION ALL
+SELECT
+  a.channel                                   AS Channel,
+  'DSE'                                       AS Env,
+  a.dse_alerts                                AS Alerts,
+  j.j_alert                                    AS Intersect_Alert_Pct,
+  a.dse_fraud_cnt                              AS Fraud_Count,
+  a.dse_fraud_val_gbp                          AS Fraud_Value_GBP,
+  j.j_fraud                                    AS Intersect_Fraud_Pct
+FROM agg a
+JOIN jacc j USING (channel)
+ORDER BY Channel, Env;
