@@ -1,0 +1,78 @@
+-- ======================================================================
+-- TIME DISTRIBUTION: per Channel × Date × Hour
+-- Dataset: PROJECT.DATASET.analysis_rows_alerts
+-- Money column: tbt_tran_amt
+-- event_received_at: Unix time in milliseconds (string) → convert via CAST + TIMESTAMP_MILLIS
+--
+-- What you'll get:
+--   • Channel × Date × Hour slices
+--   • dse/prod/both alerts, one-sided alerts
+--   • Jaccard-style ∩ Alert % and ∩ Fraud % for the slice
+--   • Fraud counts & £ values by env
+-- ======================================================================
+
+WITH base AS (
+  SELECT
+    portfolio_key AS channel,
+    DSE_ALERT, PROD_ALERT, BOTH_ALERT, DSE_ONLY_ALERT, PROD_ONLY_ALERT,
+    FLAG_FRAUD,
+    SAFE_CAST(tbt_tran_amt AS NUMERIC) AS amount_gbp,
+
+    -- Convert ms string → TIMESTAMP
+    DATE(TIMESTAMP_MILLIS(CAST(event_received_at AS INT64))) AS event_date,
+    EXTRACT(HOUR FROM TIMESTAMP_MILLIS(CAST(event_received_at AS INT64))) AS event_hour
+  FROM `PROJECT.DATASET.analysis_rows_alerts`
+),
+
+slice AS (
+  SELECT
+    channel, event_date, event_hour,
+
+    -- Alerts
+    SUM(DSE_ALERT)  AS dse_alerts,
+    SUM(PROD_ALERT) AS prod_alerts,
+    SUM(BOTH_ALERT) AS both_alerts,
+    SUM(DSE_ONLY_ALERT) AS dse_only_alerts,
+    SUM(PROD_ONLY_ALERT) AS prod_only_alerts,
+
+    -- Fraud-in-alert (counts & £)
+    SUM(CASE WHEN DSE_ALERT =1 AND FLAG_FRAUD=1 THEN 1 ELSE 0 END) AS dse_fraud_cnt,
+    SUM(CASE WHEN PROD_ALERT=1 AND FLAG_FRAUD=1 THEN 1 ELSE 0 END) AS prod_fraud_cnt,
+    SUM(CASE WHEN BOTH_ALERT=1 AND FLAG_FRAUD=1 THEN 1 ELSE 0 END) AS both_fraud_cnt,
+
+    SUM(CASE WHEN DSE_ALERT =1 AND FLAG_FRAUD=1 THEN amount_gbp ELSE 0 END) AS dse_fraud_val_gbp,
+    SUM(CASE WHEN PROD_ALERT=1 AND FLAG_FRAUD=1 THEN amount_gbp ELSE 0 END) AS prod_fraud_val_gbp
+  FROM base
+  GROUP BY channel, event_date, event_hour
+)
+
+SELECT
+  channel,
+  event_date,
+  event_hour,
+
+  -- Volumes
+  dse_alerts, prod_alerts, both_alerts,
+  dse_only_alerts, prod_only_alerts,
+
+  -- Symmetric intersections for the slice
+  SAFE_DIVIDE(both_alerts, (dse_alerts + prod_alerts - both_alerts)) AS j_alert_slice,   -- ∩ Alert %
+  SAFE_DIVIDE(both_fraud_cnt, (dse_fraud_cnt + prod_fraud_cnt - both_fraud_cnt)) AS j_fraud_slice, -- ∩ Fraud %
+
+  -- Fraud volumes
+  dse_fraud_cnt, prod_fraud_cnt, both_fraud_cnt,
+  dse_fraud_val_gbp, prod_fraud_val_gbp
+FROM slice
+ORDER BY channel, event_date, event_hour;
+
+
+
+SELECT
+  event_received_at,
+  TIMESTAMP_MILLIS(CAST(event_received_at AS INT64)) AS ts_converted,
+  DATE(TIMESTAMP_MILLIS(CAST(event_received_at AS INT64))) AS date_converted,
+  EXTRACT(HOUR FROM TIMESTAMP_MILLIS(CAST(event_received_at AS INT64))) AS hour_converted
+FROM `PROJECT.DATASET.analysis_rows_alerts`
+LIMIT 20;
+
+
