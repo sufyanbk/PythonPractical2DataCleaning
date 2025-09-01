@@ -1,0 +1,53 @@
+-- 🔧 Set your table and tolerance (in native score units)
+DECLARE tgt TABLE DEFAULT `project_id.dataset.prod_scored`;  -- <-- replace
+DECLARE tol FLOAT64 DEFAULT 1e-9;  -- e.g., 1e-6 or 1e-9 depending on precision
+
+-- ===== Overall match rates =====
+WITH base AS (
+  SELECT
+    lifecycle_id,
+    event_received_at,
+    dse_raw_score,            raw_score,
+    dse_mt_score,             mt_score,
+    dse_raw_score_X1000_rounded  AS dse_raw_rnd,
+    raw_score_X1000_rounded      AS prod_raw_rnd,
+    dse_mt_score_X1000_rounded   AS dse_mt_rnd,
+    mt_score_X1000_rounded       AS prod_mt_rnd
+  FROM tgt
+),
+stats AS (
+  SELECT
+    COUNT(*)                                                                AS n_rows,
+
+    -- Null availability
+    SUM(CASE WHEN dse_raw_score IS NULL OR raw_score IS NULL THEN 1 ELSE 0 END) AS raw_null_rows,
+    SUM(CASE WHEN dse_mt_score  IS NULL OR mt_score  IS NULL THEN 1 ELSE 0 END) AS mt_null_rows,
+
+    -- Tolerance matches
+    SUM(CASE WHEN dse_raw_score IS NOT NULL AND raw_score IS NOT NULL
+              AND ABS(dse_raw_score - raw_score) <= tol THEN 1 ELSE 0 END)      AS raw_matches_tol,
+    SUM(CASE WHEN dse_mt_score  IS NOT NULL AND mt_score  IS NOT NULL
+              AND ABS(dse_mt_score  - mt_score)  <= tol THEN 1 ELSE 0 END)      AS mt_matches_tol,
+
+    -- Rounded matches (decision-level parity)
+    SUM(CASE WHEN dse_raw_rnd IS NOT NULL AND prod_raw_rnd IS NOT NULL
+              AND dse_raw_rnd = prod_raw_rnd THEN 1 ELSE 0 END)                 AS raw_matches_rnd,
+    SUM(CASE WHEN dse_mt_rnd  IS NOT NULL AND prod_mt_rnd  IS NOT NULL
+              AND dse_mt_rnd  = prod_mt_rnd  THEN 1 ELSE 0 END)                 AS mt_matches_rnd
+  FROM base
+)
+SELECT
+  n_rows,
+
+  -- RAW score parity
+  raw_matches_tol                                         AS raw_match_count_tol,
+  ROUND(100 * raw_matches_tol / (n_rows - raw_null_rows), 2) AS raw_match_rate_tol_pct,
+  raw_matches_rnd                                         AS raw_match_count_rnd,
+  ROUND(100 * raw_matches_rnd / (n_rows - raw_null_rows), 2) AS raw_match_rate_rnd_pct,
+
+  -- MT score parity
+  mt_matches_tol                                          AS mt_match_count_tol,
+  ROUND(100 * mt_matches_tol / (n_rows - mt_null_rows), 2)  AS mt_match_rate_tol_pct,
+  mt_matches_rnd                                          AS mt_match_count_rnd,
+  ROUND(100 * mt_matches_rnd / (n_rows - mt_null_rows), 2)  AS mt_match_rate_rnd_pct
+FROM stats;
