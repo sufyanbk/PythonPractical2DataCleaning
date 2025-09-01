@@ -1,0 +1,143 @@
+-- =====================================================================
+-- SCORE PARITY: DSE vs PROD — one-shot script (BigQuery Standard SQL)
+-- =====================================================================
+-- WHAT YOU GET:
+--   1) TEMP TABLE base .......... pulls the fields we care about
+--   2) OVERALL SUMMARY .......... exact + rounded(X1000) match rates
+--   3) TEMP TABLE classified .... adds boolean flags + numeric diffs
+--   4) SAMPLES: matches ......... handy examples where both rounded match
+--   5) SAMPLES: mismatches ...... examples + reason string
+--   6) OPTIONAL BREAKDOWNS ...... by day and by decision (uncomment)
+-- =====================================================================
+
+-- [1] STAGE: Create a base temp table with DSE/PROD scores and rounded variants.
+CREATE TEMP TABLE base AS
+SELECT
+  lifecycle_id,
+  customer_id,
+  event_received_at,
+  decision,
+
+  -- DSE vs PROD raw and mt scores
+  dse_raw_score,                  raw_score,
+  dse_mt_score,                   mt_score,
+
+  -- Decision-level rounded (×1000 then rounded in your schema)
+  dse_raw_score_X1000_rounded  AS dse_raw_rnd,
+  raw_score_X1000_rounded      AS prod_raw_rnd,
+  dse_mt_score_X1000_rounded   AS dse_mt_rnd,
+  mt_score_X1000_rounded       AS prod_mt_rnd
+FROM `project.dataset.table`;  -- TODO: replace with your table path
+
+-- [2] SUMMARY: Overall match rates (exact float equality + rounded parity).
+--     Returns one row with counts and percentages. Uses SAFE_DIVIDE to dodge /0.
+WITH agg AS (
+  SELECT
+    COUNT(*) AS n_rows,
+
+    -- Availability
+    COUNTIF(dse_raw_score IS NOT NULL AND raw_score IS NOT NULL) AS raw_non_null,
+    COUNTIF(dse_mt_score  IS NOT NULL AND mt_score  IS NOT NULL) AS mt_non_null,
+    COUNTIF(dse_raw_rnd   IS NOT NULL AND prod_raw_rnd IS NOT NULL) AS raw_rnd_non_null,
+    COUNTIF(dse_mt_rnd    IS NOT NULL AND prod_mt_rnd  IS NOT NULL) AS mt_rnd_non_null,
+
+    -- Exact float equality (no tolerance)
+    COUNTIF(dse_raw_score = raw_score AND dse_raw_score IS NOT NULL AND raw_score IS NOT NULL) AS raw_exact_matches,
+    COUNTIF(dse_mt_score  = mt_score  AND dse_mt_score  IS NOT NULL AND mt_score  IS NOT NULL) AS mt_exact_matches,
+
+    -- Rounded ×1000 parity
+    COUNTIF(dse_raw_rnd = prod_raw_rnd AND dse_raw_rnd IS NOT NULL AND prod_raw_rnd IS NOT NULL) AS raw_rnd_matches,
+    COUNTIF(dse_mt_rnd  = prod_mt_rnd  AND dse_mt_rnd  IS NOT NULL AND prod_mt_rnd  IS NOT NULL) AS mt_rnd_matches
+  FROM base
+)
+SELECT
+  'OVERALL_SUMMARY' AS section,
+
+  n_rows,
+
+  -- RAW
+  raw_exact_matches AS raw_exact_match_count,
+  ROUND(100 * SAFE_DIVIDE(raw_exact_matches, raw_non_null), 2) AS raw_exact_match_rate_pct,
+  raw_rnd_matches   AS raw_rnd_match_count,
+  ROUND(100 * SAFE_DIVIDE(raw_rnd_matches,   raw_rnd_non_null), 2) AS raw_rnd_match_rate_pct,
+
+  -- MT
+  mt_exact_matches AS mt_exact_match_count,
+  ROUND(100 * SAFE_DIVIDE(mt_exact_matches, mt_non_null), 2)  AS mt_exact_match_rate_pct,
+  mt_rnd_matches   AS mt_rnd_match_count,
+  ROUND(100 * SAFE_DIVIDE(mt_rnd_matches,   mt_rnd_non_null), 2)  AS mt_rnd_match_rate_pct
+FROM agg;
+
+-- [3] STAGE: Classification flags + diffs into another temp table.
+CREATE TEMP TABLE classified AS
+SELECT
+  b.*,
+
+  -- Exact equality flags (floats)
+  (dse_raw_score = raw_score AND dse_raw_score IS NOT NULL AND raw_score IS NOT NULL) AS raw_exact_match,
+  (dse_mt_score  = mt_score  AND dse_mt_score  IS NOT NULL AND mt_score  IS NOT NULL) AS mt_exact_match,
+
+  -- Decision-level parity flags (rounded ×1000 fields)
+  (dse_raw_rnd = prod_raw_rnd AND dse_raw_rnd IS NOT NULL AND prod_raw_rnd IS NOT NULL) AS raw_rnd_match,
+  (dse_mt_rnd  = prod_mt_rnd  AND dse_mt_rnd  IS NOT NULL AND prod_mt_rnd  IS NOT NULL) AS mt_rnd_match,
+
+  -- Helpful numeric diffs for inspection
+  (dse_raw_score - raw_score) AS raw_diff,
+  (dse_mt_score  - mt_score)  AS mt_diff
+FROM base b;
+
+-- [4] SAMPLES: Example MATCHES where both rounded parities align (decision-level).
+--     LIMIT can be adjusted; ORDER BY gives you consistent samples by time.
+SELECT
+  'EXAMPLE_MATCHES' AS section,
+  lifecycle_id, event_received_at, decision,
+  dse_raw_score, raw_score, dse_mt_score, mt_score,
+  dse_raw_rnd,  prod_raw_rnd, dse_mt_rnd,  prod_mt_rnd
+FROM classified
+WHERE raw_rnd_match AND mt_rnd_match
+ORDER BY event_received_at DESC
+LIMIT 50;
+
+-- [5] SAMPLES: Example MISMATCHES (any mismatch), with a quick reason string.
+SELECT
+  'EXAMPLE_MISMATCHES' AS section,
+  lifecycle_id, event_received_at, decision,
+  dse_raw_score, raw_score, raw_diff,
+  dse_mt_score,  mt_score,  mt_diff,
+  dse_raw_rnd,   prod_raw_rnd,
+  dse_mt_rnd,    prod_mt_rnd,
+  -- Human-friendly reason
+  TRIM(
+    CONCAT(
+      IF(NOT raw_rnd_match, 'RAW_RND_DIFF ', ''),
+      IF(NOT mt_rnd_match,  'MT_RND_DIFF ',  ''),
+      IF(NOT raw_exact_match, 'RAW_EXACT_DIFF ', ''),
+      IF(NOT mt_exact_match,  'MT_EXACT_DIFF ', '')
+    )
+  ) AS mismatch_reason
+FROM classified
+WHERE NOT (raw_rnd_match AND mt_rnd_match AND raw_exact_match AND mt_exact_match)
+ORDER BY event_received_at DESC
+LIMIT 50;
+
+-- [6] OPTIONAL: Uncomment for daily breakdown of rounded parity (business-facing).
+-- SELECT
+--   DATE(event_received_at) AS event_date,
+--   COUNT(*) AS rows,
+--   COUNTIF(raw_rnd_match) AS raw_rnd_match_count,
+--   ROUND(100 * SAFE_DIVIDE(COUNTIF(raw_rnd_match), COUNT(*)), 2) AS raw_rnd_match_rate_pct,
+--   COUNTIF(mt_rnd_match)  AS mt_rnd_match_count,
+--   ROUND(100 * SAFE_DIVIDE(COUNTIF(mt_rnd_match),  COUNT(*)), 2) AS mt_rnd_match_rate_pct
+-- FROM classified
+-- GROUP BY event_date
+-- ORDER BY event_date DESC;
+
+-- [7] OPTIONAL: Uncomment for breakdown by decision.
+-- SELECT
+--   decision,
+--   COUNT(*) AS rows,
+--   ROUND(100 * SAFE_DIVIDE(COUNTIF(raw_rnd_match), COUNT(*)), 2) AS raw_rnd_match_rate_pct,
+--   ROUND(100 * SAFE_DIVIDE(COUNTIF(mt_rnd_match),  COUNT(*)), 2) AS mt_rnd_match_rate_pct
+-- FROM classified
+-- GROUP BY decision
+-- ORDER BY rows DESC;
