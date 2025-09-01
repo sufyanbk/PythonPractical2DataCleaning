@@ -1,0 +1,111 @@
+-- =====================================================================
+-- DSE vs PROD SCORE PARITY (Whole-number using ×1000 rounded fields)
+-- =====================================================================
+-- What this does:
+--   [1] Create TEMP TABLE base: pull only the ×1000 rounded columns and
+--       derive whole-number ints for clean equality checks.
+--   [2] Return an OVERALL SUMMARY of match counts and rates.
+--   [3] Create TEMP TABLE classified with boolean flags + whole-number diffs.
+--   [4] Sample MATCHES (both whole-number parities align).
+--   [5] Sample MISMATCHES (any whole-number mismatch) + quick reason.
+-- =====================================================================
+
+-- [1] STAGE: bring in only the rounded ×1000 fields, and coerce to whole-number INT64
+CREATE TEMP TABLE base AS
+SELECT
+  lifecycle_id,
+  customer_id,
+  event_received_at,
+  decision,
+
+  -- Rounded ×1000 fields from each environment
+  dse_raw_score_X1000_rounded   AS dse_raw_x1000,
+  raw_score_X1000_rounded       AS prod_raw_x1000,
+  dse_mt_score_X1000_rounded    AS dse_mt_x1000,
+  mt_score_X1000_rounded        AS prod_mt_x1000,
+
+  -- Whole-number versions (ensure integer type even if source is numeric/float)
+  CAST(ROUND(dse_raw_score_X1000_rounded) AS INT64)  AS dse_raw_whole,
+  CAST(ROUND(raw_score_X1000_rounded)     AS INT64)  AS prod_raw_whole,
+  CAST(ROUND(dse_mt_score_X1000_rounded)  AS INT64)  AS dse_mt_whole,
+  CAST(ROUND(mt_score_X1000_rounded)      AS INT64)  AS prod_mt_whole
+FROM `project.dataset.table`;  -- <-- replace with your table path
+
+-- [2] SUMMARY: overall whole-number match rates for RAW and MT
+WITH agg AS (
+  SELECT
+    COUNT(*) AS n_rows,
+
+    COUNTIF(dse_raw_whole IS NOT NULL AND prod_raw_whole IS NOT NULL) AS raw_non_null,
+    COUNTIF(dse_mt_whole  IS NOT NULL AND prod_mt_whole  IS NOT NULL) AS mt_non_null,
+
+    COUNTIF(dse_raw_whole = prod_raw_whole
+            AND dse_raw_whole IS NOT NULL AND prod_raw_whole IS NOT NULL) AS raw_whole_matches,
+
+    COUNTIF(dse_mt_whole = prod_mt_whole
+            AND dse_mt_whole IS NOT NULL AND prod_mt_whole IS NOT NULL)   AS mt_whole_matches
+  FROM base
+)
+SELECT
+  'OVERALL_SUMMARY' AS section,
+  n_rows,
+
+  -- RAW whole-number parity
+  raw_whole_matches AS raw_whole_match_count,
+  ROUND(100 * SAFE_DIVIDE(raw_whole_matches, raw_non_null), 2) AS raw_whole_match_rate_pct,
+
+  -- MT whole-number parity
+  mt_whole_matches  AS mt_whole_match_count,
+  ROUND(100 * SAFE_DIVIDE(mt_whole_matches,  mt_non_null),  2) AS mt_whole_match_rate_pct
+FROM agg;
+
+-- [3] CLASSIFY: flags + diffs (whole-number space only)
+CREATE TEMP TABLE classified AS
+SELECT
+  b.*,
+  -- boolean flags for whole-number equality
+  (dse_raw_whole = prod_raw_whole AND dse_raw_whole IS NOT NULL AND prod_raw_whole IS NOT NULL) AS raw_whole_match,
+  (dse_mt_whole  = prod_mt_whole  AND dse_mt_whole  IS NOT NULL AND prod_mt_whole  IS NOT NULL) AS mt_whole_match,
+
+  -- diffs in whole-number space (useful for triage)
+  SAFE_CAST(dse_raw_whole AS INT64) - SAFE_CAST(prod_raw_whole AS INT64) AS raw_whole_diff,
+  SAFE_CAST(dse_mt_whole  AS INT64) - SAFE_CAST(prod_mt_whole  AS INT64) AS mt_whole_diff
+FROM base b;
+
+-- [4] EXAMPLE MATCHES: both RAW and MT whole-number parities align
+SELECT
+  'EXAMPLE_MATCHES' AS section,
+  lifecycle_id, event_received_at, decision,
+  dse_raw_x1000,  prod_raw_x1000,  dse_raw_whole, prod_raw_whole,
+  dse_mt_x1000,   prod_mt_x1000,   dse_mt_whole,  prod_mt_whole
+FROM classified
+WHERE raw_whole_match AND mt_whole_match
+ORDER BY event_received_at DESC
+LIMIT 50;
+
+-- [5] EXAMPLE MISMATCHES: any whole-number mismatch + reason string
+SELECT
+  'EXAMPLE_MISMATCHES' AS section,
+  lifecycle_id, event_received_at, decision,
+
+  dse_raw_x1000,  prod_raw_x1000,  dse_raw_whole, prod_raw_whole, raw_whole_diff,
+  dse_mt_x1000,   prod_mt_x1000,   dse_mt_whole,  prod_mt_whole,  mt_whole_diff,
+
+  TRIM(CONCAT(
+    IF(NOT raw_whole_match, 'RAW_WHOLE_DIFF ', ''),
+    IF(NOT mt_whole_match,  'MT_WHOLE_DIFF ',  '')
+  )) AS mismatch_reason
+FROM classified
+WHERE NOT (raw_whole_match AND mt_whole_match)
+ORDER BY event_received_at DESC
+LIMIT 50;
+
+-- OPTIONAL: uncomment for daily breakdown in whole-number space
+-- SELECT
+--   DATE(event_received_at) AS event_date,
+--   COUNT(*) AS rows,
+--   ROUND(100 * SAFE_DIVIDE(COUNTIF(raw_whole_match), COUNT(*)), 2) AS raw_whole_match_rate_pct,
+--   ROUND(100 * SAFE_DIVIDE(COUNTIF(mt_whole_match),  COUNT(*)), 2) AS mt_whole_match_rate_pct
+-- FROM classified
+-- GROUP BY event_date
+-- ORDER BY event_date DESC;
