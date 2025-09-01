@@ -1,0 +1,70 @@
+v
+-- =========================================================
+-- DSE vs PROD raw score comparison (X1000) — single table
+-- Compares ONLY dse_raw_score_X1000 vs raw_score_X1000
+-- Excludes (0,0) rows from match/mismatch (not comparable)
+-- =========================================================
+
+-- Build once for this session
+CREATE TEMP TABLE compare AS
+SELECT
+  lifecycle_id,
+  customer_id,
+  event_received_at,
+  SAFE_CAST(Portfolio AS STRING) AS portfolio,
+
+  SAFE_CAST(dse_raw_score_X1000 AS INT64) AS dse_x1k,
+  SAFE_CAST(raw_score_X1000     AS INT64) AS prod_x1k,
+
+  -- Differences
+  SAFE_CAST(dse_raw_score_X1000 AS INT64) - SAFE_CAST(raw_score_X1000 AS INT64) AS diff,
+  ABS(SAFE_CAST(dse_raw_score_X1000 AS INT64) - SAFE_CAST(raw_score_X1000 AS INT64)) AS abs_diff,
+
+  -- Match flag: exact equality, but ignore (0,0) and any NULLs
+  CASE
+    WHEN dse_raw_score_X1000 IS NULL OR raw_score_X1000 IS NULL THEN NULL
+    WHEN SAFE_CAST(dse_raw_score_X1000 AS INT64) = 0 AND SAFE_CAST(raw_score_X1000 AS INT64) = 0 THEN NULL
+    WHEN SAFE_CAST(dse_raw_score_X1000 AS INT64) = SAFE_CAST(raw_score_X1000 AS INT64) THEN 1
+    ELSE 0
+  END AS is_match
+FROM `project.dataset.dse_prod_incorrect_scores`;
+
+-- 1) Overall headline: match/mismatch on comparable rows
+SELECT
+  COUNT(*) AS total_rows,
+  COUNTIF(is_match IS NOT NULL) AS comparable_rows,  -- excludes (0,0) + NULLs
+  ROUND(100 * AVG(is_match), 2)      AS match_pct,
+  ROUND(100 * AVG(1 - is_match), 2)  AS mismatch_pct,
+  -- sanity counters
+  COUNTIF(dse_x1k = 0 AND prod_x1k != 0) AS dse_zero_prod_nonzero,
+  COUNTIF(dse_x1k != 0 AND prod_x1k = 0) AS dse_nonzero_prod_zero,
+  COUNTIF(dse_x1k = 0 AND prod_x1k = 0)  AS both_zero_excluded
+FROM compare;
+
+-- 2) Example matches (equal, non-zero)
+SELECT
+  lifecycle_id, customer_id, event_received_at, portfolio,
+  dse_x1k, prod_x1k, diff
+FROM compare
+WHERE is_match = 1
+LIMIT 10;
+
+-- 3) Example mismatches (largest gaps first)
+SELECT
+  lifecycle_id, customer_id, event_received_at, portfolio,
+  dse_x1k, prod_x1k, diff, abs_diff
+FROM compare
+WHERE is_match = 0
+ORDER BY abs_diff DESC
+LIMIT 10;
+
+-- 4) Tiny portfolio view (optional)
+SELECT
+  portfolio,
+  COUNTIF(is_match = 1) AS n_matches,
+  COUNTIF(is_match = 0) AS n_mismatches,
+  ROUND(100 * AVG(is_match), 2) AS match_pct,
+  ROUND(AVG(abs_diff), 2) AS avg_abs_diff
+FROM compare
+GROUP BY portfolio
+ORDER BY n_mismatches DESC;
