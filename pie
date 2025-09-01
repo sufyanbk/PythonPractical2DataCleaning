@@ -1,0 +1,84 @@
+-- ========= Simple, single-table mismatch analysis =========
+-- Source table: myproject.mydataset.dse_prod_incorrect_scores
+-- Compares *_X1000 fields (exact match by default; tweak tolerance below)
+
+DECLARE diff_tolerance INT64 DEFAULT 0; -- e.g., 0 exact; 1 treats ±1 as match
+
+-- 1) Build once: session temp table "compare"
+CREATE TEMP TABLE compare AS
+SELECT
+  lifecycle_id,
+  customer_id,
+  event_received_at,
+  SAFE_CAST(Portfolio AS STRING) AS portfolio,
+
+  SAFE_CAST(dse_raw_score_X1000 AS INT64) AS dse_raw_x1k,
+  SAFE_CAST(raw_score_X1000     AS INT64) AS prod_raw_x1k,
+  SAFE_CAST(dse_mt_score_X1000  AS INT64) AS dse_mt_x1k,
+  SAFE_CAST(mt_score_X1000      AS INT64) AS prod_mt_x1k,
+
+  -- diffs
+  SAFE_CAST(dse_raw_score_X1000 AS INT64) - SAFE_CAST(raw_score_X1000 AS INT64) AS raw_diff,
+  ABS(SAFE_CAST(dse_raw_score_X1000 AS INT64) - SAFE_CAST(raw_score_X1000 AS INT64)) AS raw_abs_diff,
+  SAFE_CAST(dse_mt_score_X1000 AS INT64) - SAFE_CAST(mt_score_X1000 AS INT64) AS mt_diff,
+  ABS(SAFE_CAST(dse_mt_score_X1000 AS INT64) - SAFE_CAST(mt_score_X1000 AS INT64)) AS mt_abs_diff,
+
+  -- match flags using tolerance
+  CASE
+    WHEN dse_raw_score_X1000 IS NULL OR raw_score_X1000 IS NULL THEN NULL
+    WHEN ABS(SAFE_CAST(dse_raw_score_X1000 AS INT64) - SAFE_CAST(raw_score_X1000 AS INT64)) <= diff_tolerance THEN 1
+    ELSE 0
+  END AS raw_is_match,
+  CASE
+    WHEN dse_mt_score_X1000 IS NULL OR mt_score_X1000 IS NULL THEN NULL
+    WHEN ABS(SAFE_CAST(dse_mt_score_X1000 AS INT64) - SAFE_CAST(mt_score_X1000 AS INT64)) <= diff_tolerance THEN 1
+    ELSE 0
+  END AS mt_is_match
+FROM `myproject.mydataset.dse_prod_incorrect_scores`;
+
+-- 2) Overall rates
+SELECT
+  COUNT(*) AS total_rows,
+  ROUND(100 * AVG(raw_is_match), 2) AS raw_match_pct,
+  ROUND(100 * AVG(1 - raw_is_match), 2) AS raw_mismatch_pct,
+  ROUND(100 * AVG(mt_is_match), 2)  AS mt_match_pct,
+  ROUND(100 * AVG(1 - mt_is_match), 2)  AS mt_mismatch_pct
+FROM compare;
+
+-- 3) Example matches (both match)
+SELECT
+  lifecycle_id, customer_id, event_received_at, portfolio,
+  dse_raw_x1k, prod_raw_x1k, raw_diff,
+  dse_mt_x1k,  prod_mt_x1k,  mt_diff
+FROM compare
+WHERE raw_is_match = 1 AND mt_is_match = 1
+LIMIT 10;
+
+-- 4) Example mismatches (largest gap first)
+SELECT
+  lifecycle_id, customer_id, event_received_at, portfolio,
+  dse_raw_x1k, prod_raw_x1k, raw_diff, raw_abs_diff,
+  dse_mt_x1k,  prod_mt_x1k,  mt_diff,  mt_abs_diff
+FROM compare
+WHERE raw_is_match = 0 OR mt_is_match = 0
+ORDER BY GREATEST(COALESCE(raw_abs_diff,0), COALESCE(mt_abs_diff,0)) DESC
+LIMIT 10;
+
+-- 5) Tiny portfolio breakdown
+SELECT
+  portfolio,
+  COUNT(*) AS n_rows,
+  ROUND(100 * AVG(raw_is_match), 2) AS raw_match_pct,
+  ROUND(100 * AVG(mt_is_match), 2)  AS mt_match_pct,
+  ROUND(AVG(raw_abs_diff), 2) AS avg_raw_abs_diff,
+  ROUND(AVG(mt_abs_diff),  2) AS avg_mt_abs_diff
+FROM compare
+GROUP BY portfolio
+ORDER BY n_rows DESC;
+
+-- 6) Nulls sanity check
+SELECT
+  COUNT(*) AS total_rows,
+  COUNTIF(dse_raw_x1k IS NULL OR prod_raw_x1k IS NULL) AS raw_null_rows,
+  COUNTIF(dse_mt_x1k  IS NULL OR prod_mt_x1k  IS NULL) AS mt_null_rows
+FROM compare;
