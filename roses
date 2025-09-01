@@ -1,0 +1,205 @@
+
+-- ============================
+-- DSE vs PROD Score Mismatch Pack (X1000)
+-- One script to compute, summarize, and present
+-- ============================
+
+-- ---------- 0) PARAMETERS ----------
+DECLARE src_table STRING DEFAULT 'project.dataset.table_name';   -- <-- change me
+DECLARE diff_tolerance INT64 DEFAULT 0;  -- e.g., 0 = exact match; 1 = allow ±1 on x1000 scale
+DECLARE dt_min TIMESTAMP DEFAULT TIMESTAMP('1970-01-01');        -- optional time filter (inclusive)
+DECLARE dt_max TIMESTAMP DEFAULT TIMESTAMP('2100-01-01');        -- optional time filter (exclusive)
+
+-- ---------- 1) BUILD ROW-LEVEL COMPARISON ----------
+-- Creates a temporary analysis table with all per-row metrics you’ll reuse below.
+CREATE TEMP TABLE tmp_score_compare AS
+WITH base AS (
+  SELECT
+    -- identifiers / context
+    lifecycle_id,
+    customer_id,
+    SAFE.CAST(event_received_at AS TIMESTAMP) AS event_received_at,
+    SAFE_CAST(Portfolio AS STRING) AS portfolio,
+    SAFE_CAST(portfolio_key AS STRING) AS portfolio_key,
+
+    -- the x1000 scores from DSE and PROD
+    SAFE_CAST(dse_raw_score_X1000 AS INT64)  AS dse_raw_x1k,
+    SAFE_CAST(raw_score_X1000     AS INT64)  AS prod_raw_x1k,
+    SAFE_CAST(dse_mt_score_X1000  AS INT64)  AS dse_mt_x1k,
+    SAFE_CAST(mt_score_X1000      AS INT64)  AS prod_mt_x1k,
+
+    -- optional rounding flags if your table already computed them
+    SAFE_CAST(dse_raw_score_X1000_rounded AS INT64)  AS dse_raw_x1k_round,
+    SAFE_CAST(raw_score_X1000_rounded     AS INT64)  AS prod_raw_x1k_round,
+    SAFE_CAST(dse_mt_score_X1000_rounded  AS INT64)  AS dse_mt_x1k_round,
+    SAFE_CAST(mt_score_X1000_rounded      AS INT64)  AS prod_mt_x1k_round,
+
+    -- business context (keep what’s useful; these are examples from your schema)
+    SAFE_CAST(tbt_tran_amt AS FLOAT64) AS tbt_tran_amt,
+    SAFE_CAST(FLAG_FRAUD   AS INT64)   AS flag_fraud,
+    SAFE_CAST(FRAUD_TYPE   AS STRING)  AS fraud_type,
+    SAFE_CAST(ACTUAL_FRAUD_REASON AS STRING) AS actual_fraud_reason
+  FROM UNNEST([src_table]) AS src_table_str
+  JOIN `project.dataset.__TABLES__` T ON TRUE   -- dummy join to allow dynamic table
+  -- ^ the line above is a trick to allow DECLAREd src_table; if your env disallows it,
+  --   just replace everything with a static table reference and remove the UNNEST+JOIN.
+)
+SELECT
+  *
+  -- raw score deltas
+  , (dse_raw_x1k - prod_raw_x1k)              AS raw_diff
+  , ABS(dse_raw_x1k - prod_raw_x1k)           AS raw_abs_diff
+  , CASE WHEN ABS(dse_raw_x1k - prod_raw_x1k) <= diff_tolerance THEN 1 ELSE 0 END AS raw_is_match
+
+  -- mt score deltas
+  , (dse_mt_x1k - prod_mt_x1k)                AS mt_diff
+  , ABS(dse_mt_x1k - prod_mt_x1k)             AS mt_abs_diff
+  , CASE WHEN ABS(dse_mt_x1k - prod_mt_x1k) <= diff_tolerance THEN 1 ELSE 0 END AS mt_is_match
+
+  -- convenience flags
+  , CASE WHEN dse_raw_x1k IS NULL OR prod_raw_x1k IS NULL THEN 1 ELSE 0 END AS raw_has_null
+  , CASE WHEN dse_mt_x1k  IS NULL OR prod_mt_x1k  IS NULL THEN 1 ELSE 0 END AS mt_has_null
+
+  -- time helpers
+  , event_received_at AS evt_ts_utc
+  , FORMAT_TIMESTAMP('%Y-%m-%d', event_received_at) AS evt_date
+  , EXTRACT(HOUR FROM event_received_at) AS evt_hour
+FROM base
+WHERE event_received_at >= dt_min AND event_received_at < dt_max
+;
+
+-- ---------- 2) OVERALL MATCH / MISMATCH RATES ----------
+-- What % of rows match within the tolerance for RAW and MT?
+SELECT
+  COUNT(*) AS total_rows,
+  ROUND(100 * AVG(CASE WHEN raw_has_null=1 THEN NULL ELSE raw_is_match END), 2) AS raw_match_pct,
+  ROUND(100 * AVG(CASE WHEN raw_has_null=1 THEN NULL ELSE 1-raw_is_match END), 2) AS raw_mismatch_pct,
+  ROUND(100 * AVG(CASE WHEN mt_has_null =1 THEN NULL ELSE mt_is_match  END), 2) AS mt_match_pct,
+  ROUND(100 * AVG(CASE WHEN mt_has_null =1 THEN NULL ELSE 1-mt_is_match END), 2) AS mt_mismatch_pct
+FROM tmp_score_compare
+;
+
+-- ---------- 3) EXAMPLES: PERFECT MATCHES ----------
+-- Show some clean matches (RAW and MT both match).
+SELECT
+  lifecycle_id, customer_id, evt_ts_utc, portfolio,
+  dse_raw_x1k, prod_raw_x1k, raw_diff,
+  dse_mt_x1k,  prod_mt_x1k,  mt_diff
+FROM tmp_score_compare
+WHERE raw_is_match=1 AND mt_is_match=1
+LIMIT 20
+;
+
+-- ---------- 4) EXAMPLES: WORST RAW MISMATCHES ----------
+-- Biggest absolute gaps for RAW.
+SELECT
+  lifecycle_id, customer_id, evt_ts_utc, portfolio,
+  dse_raw_x1k, prod_raw_x1k, raw_diff, raw_abs_diff,
+  tbt_tran_amt, flag_fraud, fraud_type, actual_fraud_reason
+FROM tmp_score_compare
+WHERE raw_has_null=0 AND raw_is_match=0
+ORDER BY raw_abs_diff DESC
+LIMIT 20
+;
+
+-- ---------- 5) EXAMPLES: WORST MT MISMATCHES ----------
+SELECT
+  lifecycle_id, customer_id, evt_ts_utc, portfolio,
+  dse_mt_x1k, prod_mt_x1k, mt_diff, mt_abs_diff,
+  tbt_tran_amt, flag_fraud, fraud_type, actual_fraud_reason
+FROM tmp_score_compare
+WHERE mt_has_null=0 AND mt_is_match=0
+ORDER BY mt_abs_diff DESC
+LIMIT 20
+;
+
+-- ---------- 6) DISTRIBUTION BUCKETS (HOW BIG ARE THE GAPS?) ----------
+-- Buckets by absolute difference (X1000 scale). Adjust thresholds as needed.
+WITH bins AS (
+  SELECT -1 AS bin_id, '<= tol' AS bin_label, diff_tolerance AS upper UNION ALL
+  SELECT  0, '1–5',    5  UNION ALL
+  SELECT  1, '6–10',  10  UNION ALL
+  SELECT  2, '11–25', 25  UNION ALL
+  SELECT  3, '26–50', 50  UNION ALL
+  SELECT  4, '51+',  999999
+)
+SELECT
+  'RAW' AS score_type,
+  b.bin_label,
+  COUNTIF(c.raw_abs_diff <= diff_tolerance) AS within_tol,
+  COUNTIF(c.raw_abs_diff > diff_tolerance AND c.raw_abs_diff <= 5)  AS d1_5,
+  COUNTIF(c.raw_abs_diff > 5 AND c.raw_abs_diff <=10)               AS d6_10,
+  COUNTIF(c.raw_abs_diff >10 AND c.raw_abs_diff <=25)               AS d11_25,
+  COUNTIF(c.raw_abs_diff >25 AND c.raw_abs_diff <=50)               AS d26_50,
+  COUNTIF(c.raw_abs_diff >50)                                       AS d51_plus
+FROM tmp_score_compare c
+JOIN bins b ON TRUE
+GROUP BY score_type, bin_label
+UNION ALL
+SELECT
+  'MT' AS score_type,
+  b.bin_label,
+  COUNTIF(c.mt_abs_diff <= diff_tolerance),
+  COUNTIF(c.mt_abs_diff > diff_tolerance AND c.mt_abs_diff <= 5),
+  COUNTIF(c.mt_abs_diff > 5 AND c.mt_abs_diff <=10),
+  COUNTIF(c.mt_abs_diff >10 AND c.mt_abs_diff <=25),
+  COUNTIF(c.mt_abs_diff >25 AND c.mt_abs_diff <=50),
+  COUNTIF(c.mt_abs_diff >50)
+FROM tmp_score_compare c
+JOIN bins b ON TRUE
+GROUP BY score_type, bin_label
+ORDER BY score_type, bin_label
+;
+
+-- ---------- 7) PORTFOLIO-LEVEL MATCH RATES ----------
+-- Helps spot systemic differences in specific books/segments.
+SELECT
+  portfolio,
+  COUNT(*) AS n,
+  ROUND(100 * AVG(CASE WHEN raw_has_null=1 THEN NULL ELSE raw_is_match END), 2) AS raw_match_pct,
+  ROUND(100 * AVG(CASE WHEN mt_has_null =1 THEN NULL ELSE mt_is_match  END), 2) AS mt_match_pct,
+  ROUND(AVG(raw_abs_diff), 2) AS avg_raw_abs_diff,
+  ROUND(AVG(mt_abs_diff),  2) AS avg_mt_abs_diff
+FROM tmp_score_compare
+GROUP BY portfolio
+ORDER BY n DESC
+;
+
+-- ---------- 8) HOURLY PATTERN (OPS/INGESTION TIMING ISSUES?) ----------
+-- If mismatches cluster by ingestion windows or SMJ timings, this will hint at it.
+SELECT
+  evt_hour,
+  COUNT(*) AS n,
+  ROUND(100 * AVG(CASE WHEN raw_has_null=1 THEN NULL ELSE 1-raw_is_match END), 2) AS raw_mismatch_pct,
+  ROUND(100 * AVG(CASE WHEN mt_has_null =1 THEN NULL ELSE 1-mt_is_match  END), 2) AS mt_mismatch_pct,
+  ROUND(AVG(raw_abs_diff), 2) AS avg_raw_abs_diff,
+  ROUND(AVG(mt_abs_diff),  2) AS avg_mt_abs_diff
+FROM tmp_score_compare
+GROUP BY evt_hour
+ORDER BY evt_hour
+;
+
+-- ---------- 9) NULLS / DATA QUALITY ----------
+-- Quantify where comparisons are impossible due to missing values.
+SELECT
+  COUNT(*) AS total_rows,
+  COUNTIF(raw_has_null=1) AS raw_with_nulls,
+  COUNTIF(mt_has_null =1) AS mt_with_nulls,
+  ROUND(100 * COUNTIF(raw_has_null=1) / COUNT(*), 2) AS raw_null_pct,
+  ROUND(100 * COUNTIF(mt_has_null =1) / COUNT(*), 2) AS mt_null_pct
+FROM tmp_score_compare
+;
+
+-- ---------- 10) PRESENTATION-FRIENDLY SNAPSHOT ----------
+-- A tidy view you can export to CSV for stakeholders (sampled to 5k).
+SELECT
+  lifecycle_id, customer_id, evt_ts_utc, portfolio,
+  dse_raw_x1k, prod_raw_x1k, raw_diff, raw_abs_diff,
+  dse_mt_x1k,  prod_mt_x1k,  mt_diff,  mt_abs_diff,
+  CASE WHEN raw_is_match=1 THEN 'MATCH' ELSE 'MISMATCH' END AS raw_status,
+  CASE WHEN mt_is_match =1 THEN 'MATCH' ELSE 'MISMATCH' END AS mt_status,
+  tbt_tran_amt, flag_fraud, fraud_type
+FROM tmp_score_compare
+ORDER BY raw_abs_diff DESC, mt_abs_diff DESC
+LIMIT 5000
+;
