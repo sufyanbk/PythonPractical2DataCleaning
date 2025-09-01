@@ -1,0 +1,46 @@
+-- =====================================================================
+-- SIMPLE MATCH % ANALYSIS: DSE vs PROD
+-- =====================================================================
+
+-- [1] Stage the data into a temp table
+CREATE TEMP TABLE base AS
+SELECT
+  lifecycle_id,
+  customer_id,
+  event_received_at,
+  decision,
+  dse_raw_score,
+  raw_score,
+  dse_mt_score,
+  mt_score
+FROM `project.dataset.table`;   -- <-- replace with your table
+
+-- [2] Overall match counts + rates
+SELECT
+  COUNT(*) AS total_rows,
+
+  -- RAW scores
+  COUNTIF(dse_raw_score = raw_score) AS raw_match_count,
+  ROUND(100 * SAFE_DIVIDE(COUNTIF(dse_raw_score = raw_score), COUNT(*)), 2) AS raw_match_rate_pct,
+
+  -- MT scores
+  COUNTIF(dse_mt_score = mt_score) AS mt_match_count,
+  ROUND(100 * SAFE_DIVIDE(COUNTIF(dse_mt_score = mt_score), COUNT(*)), 2) AS mt_match_rate_pct
+FROM base;
+
+-- [3] Example MATCHES
+SELECT
+  lifecycle_id, event_received_at, decision,
+  dse_raw_score, raw_score, dse_mt_score, mt_score
+FROM base
+WHERE dse_raw_score = raw_score AND dse_mt_score = mt_score
+LIMIT 50;
+
+-- [4] Example MISMATCHES
+SELECT
+  lifecycle_id, event_received_at, decision,
+  dse_raw_score, raw_score, (dse_raw_score - raw_score) AS raw_diff,
+  dse_mt_score, mt_score, (dse_mt_score - mt_score) AS mt_diff
+FROM base
+WHERE dse_raw_score != raw_score OR dse_mt_score != mt_score
+LIMIT 50;
