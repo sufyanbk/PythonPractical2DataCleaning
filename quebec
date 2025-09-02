@@ -1,0 +1,161 @@
+-- =====================================================================
+-- DSE vs PROD SCORE MATCH ANALYSIS (FULL SCRIPT)
+-- Table: project.dataset.45399569_analysis_rows_alerts
+-- Covers all transcript requirements:
+--   1) Per-channel exact match rates
+--   2) Hourly analysis (all transactions)
+--   3) Hourly analysis (alerts only)
+--   4) Fraud-only match rates
+--   5) Alert overlap breakdown (BOTH / DSE_ONLY / PROD_ONLY)
+--   6) Difference-size diagnostics (how far apart scores are)
+-- =====================================================================
+
+-- [STAGE] Build a clean base table with converted timestamps
+CREATE TEMP TABLE base AS
+SELECT
+  lifecycle_id,
+  customer_id,
+  Portfolio,
+  portfolio_key AS channel,
+  -- Convert Unix ms → proper timestamp
+  TIMESTAMP_MILLIS(CAST(event_received_at AS INT64)) AS event_ts_utc,
+  -- Local hour-of-day (London example, adjust TZ if needed)
+  EXTRACT(HOUR FROM TIMESTAMP_MILLIS(CAST(event_received_at AS INT64))
+          AT TIME ZONE "Europe/London") AS local_hour,
+  -- DSE vs PROD scores (already ×1000)
+  dse_raw_score_X1000 AS dse_x1000,
+  raw_score_X1000     AS prod_x1000,
+  -- Alert & fraud flags
+  DSE_ALERT,
+  PROD_ALERT,
+  BOTH_ALERT,
+  DSE_ONLY_ALERT,
+  PROD_ONLY_ALERT,
+  FLAG_FRAUD
+FROM `project.dataset.45399569_analysis_rows_alerts`;
+-- =====================================================================
+
+
+-- [A] PER-CHANNEL EXACT MATCH RATE
+SELECT
+  channel,
+  COUNT(*) AS total_rows,
+  COUNTIF(dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL) AS comparable_rows,
+  COUNTIF(dse_x1000 = prod_x1000 AND dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL) AS exact_match_count,
+  ROUND(
+    100 * SAFE_DIVIDE(
+      COUNTIF(dse_x1000 = prod_x1000
+              AND dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL),
+      COUNTIF(dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL)
+    ), 2
+  ) AS exact_match_rate_pct
+FROM base
+GROUP BY channel
+ORDER BY exact_match_rate_pct DESC, channel;
+-- =====================================================================
+
+
+-- [B1] HOURLY MATCH RATE — ALL TRANSACTIONS
+SELECT
+  channel,
+  local_hour,
+  COUNT(*) AS total_rows,
+  COUNTIF(dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL) AS comparable_rows,
+  COUNTIF(dse_x1000 = prod_x1000 AND dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL) AS exact_match_count,
+  ROUND(
+    100 * SAFE_DIVIDE(
+      COUNTIF(dse_x1000 = prod_x1000
+              AND dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL),
+      COUNTIF(dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL)
+    ), 2
+  ) AS exact_match_rate_pct
+FROM base
+GROUP BY channel, local_hour
+ORDER BY channel, local_hour;
+-- =====================================================================
+
+
+-- [B2] HOURLY MATCH RATE — ALERTED TRANSACTIONS ONLY
+SELECT
+  channel,
+  local_hour,
+  COUNT(*) AS total_alerts,
+  COUNTIF(dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL) AS comparable_alerts,
+  COUNTIF(dse_x1000 = prod_x1000 AND dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL) AS exact_match_alerts,
+  ROUND(
+    100 * SAFE_DIVIDE(
+      COUNTIF(dse_x1000 = prod_x1000
+              AND dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL),
+      COUNTIF(dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL)
+    ), 2
+  ) AS exact_match_rate_alerts_pct
+FROM base
+WHERE DSE_ALERT = 1 OR PROD_ALERT = 1 OR BOTH_ALERT = 1
+GROUP BY channel, local_hour
+ORDER BY channel, local_hour;
+-- =====================================================================
+
+
+-- [C] FRAUD-ONLY MATCH RATE
+SELECT
+  channel,
+  COUNT(*) AS total_frauds,
+  COUNTIF(dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL) AS comparable_frauds,
+  COUNTIF(dse_x1000 = prod_x1000 AND dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL) AS exact_match_frauds,
+  ROUND(
+    100 * SAFE_DIVIDE(
+      COUNTIF(dse_x1000 = prod_x1000
+              AND dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL),
+      COUNTIF(dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL)
+    ), 2
+  ) AS exact_match_rate_frauds_pct
+FROM base
+WHERE FLAG_FRAUD = 1
+GROUP BY channel
+ORDER BY exact_match_rate_frauds_pct DESC, channel;
+-- =====================================================================
+
+
+-- [D] ALERT OVERLAP BREAKDOWN (BOTH / DSE_ONLY / PROD_ONLY)
+WITH alerts AS (
+  SELECT
+    channel,
+    local_hour,
+    CASE
+      WHEN BOTH_ALERT = 1 THEN 'BOTH'
+      WHEN DSE_ONLY_ALERT = 1 THEN 'DSE_ONLY'
+      WHEN PROD_ONLY_ALERT = 1 THEN 'PROD_ONLY'
+      ELSE 'NONE'
+    END AS alert_class
+  FROM base
+  WHERE DSE_ALERT = 1 OR PROD_ALERT = 1 OR BOTH_ALERT = 1
+)
+SELECT
+  channel,
+  local_hour,
+  COUNT(*) AS alerts_total,
+  COUNTIF(alert_class = 'BOTH')      AS both_ct,
+  COUNTIF(alert_class = 'DSE_ONLY')  AS dse_only_ct,
+  COUNTIF(alert_class = 'PROD_ONLY') AS prod_only_ct,
+  ROUND(100 * SAFE_DIVIDE(COUNTIF(alert_class = 'BOTH'),      COUNT(*)), 2) AS pct_both,
+  ROUND(100 * SAFE_DIVIDE(COUNTIF(alert_class = 'DSE_ONLY'),  COUNT(*)), 2) AS pct_dse_only,
+  ROUND(100 * SAFE_DIVIDE(COUNTIF(alert_class = 'PROD_ONLY'), COUNT(*)), 2) AS pct_prod_only
+FROM alerts
+GROUP BY channel, local_hour
+ORDER BY channel, local_hour;
+-- =====================================================================
+
+
+-- [E] SCORE DIFFERENCE DIAGNOSTICS (how far apart scores are)
+SELECT
+  channel,
+  COUNT(*) AS total_rows,
+  ROUND(100 * SAFE_DIVIDE(COUNTIF(ABS(dse_x1000 - prod_x1000) <= 0.5), COUNT(*)), 2) AS pct_within_0p5,
+  ROUND(100 * SAFE_DIVIDE(COUNTIF(ABS(dse_x1000 - prod_x1000) <= 1.0), COUNT(*)), 2) AS pct_within_1,
+  ROUND(100 * SAFE_DIVIDE(COUNTIF(ABS(dse_x1000 - prod_x1000) <= 2.0), COUNT(*)), 2) AS pct_within_2,
+  ROUND(100 * SAFE_DIVIDE(COUNTIF(ABS(dse_x1000 - prod_x1000) <= 5.0), COUNT(*)), 2) AS pct_within_5,
+  ROUND(100 * SAFE_DIVIDE(COUNTIF(ABS(dse_x1000 - prod_x1000) >  5.0), COUNT(*)), 2) AS pct_over_5
+FROM base
+WHERE dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL
+GROUP BY channel
+ORDER BY pct_within_1 DESC;
