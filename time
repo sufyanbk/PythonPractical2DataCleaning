@@ -2,9 +2,10 @@
 -- DSE vs PROD score parity (equality-only) using *_X1000 fields
 -- Compares: dse_raw_score_X1000  vs  raw_score_X1000
 -- Output:
---   [A] Overall match rate (counts + %)
---   [B] Example MATCHES (what aligned rows look like)
---   [C] Example MISMATCHES (what non-aligned rows look like)
+--   [A] Overall match rate (exact equality)
+--   [B] Example MATCHES (exact equality)
+--   [C] Example MISMATCHES (exact inequality)
+--   [D] Rounded comparison (scores rounded to whole numbers before compare)
 -- =====================================================================
 
 -- [STAGE] Pull the minimal columns into a temp table for readability.
@@ -18,7 +19,7 @@ SELECT
   raw_score_X1000      AS prod_x1000
 FROM `project.dataset.45399569_dse_prod_scores`;  -- <-- adjust project/dataset if needed
 
--- [A] OVERALL MATCH RATE (exact equality, no tolerance, only when both values present)
+-- [A] OVERALL MATCH RATE (exact equality, no tolerance)
 SELECT
   'OVERALL_MATCH_RATE' AS section,
   COUNT(*) AS total_rows,
@@ -53,8 +54,22 @@ SELECT
   decision,
   dse_x1000 AS dse_raw_score_X1000,
   prod_x1000 AS raw_score_X1000,
-  (dse_x1000 - prod_x1000) AS diff_x1000  -- handy for quick eyeballing
+  (dse_x1000 - prod_x1000) AS diff_x1000
 FROM base
-WHERE dse_x1000 IS DISTINCT FROM prod_x1000  -- catches NULL vs value too
+WHERE dse_x1000 IS DISTINCT FROM prod_x1000
 ORDER BY ABS(dse_x1000 - prod_x1000) DESC, event_received_at DESC
 LIMIT 50;
+
+-- [D] ROUNDED COMPARISON: both scores rounded to whole numbers before comparing
+SELECT
+  'ROUNDED_MATCH_RATE' AS section,
+  COUNT(*) AS total_rows,
+  COUNTIF(dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL) AS comparable_rows,
+  COUNTIF(ROUND(dse_x1000) = ROUND(prod_x1000)
+          AND dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL) AS rounded_match_count,
+  ROUND(100 * SAFE_DIVIDE(
+    COUNTIF(ROUND(dse_x1000) = ROUND(prod_x1000)
+            AND dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL),
+    COUNTIF(dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL)
+  ), 2) AS rounded_match_rate_pct
+FROM base;
