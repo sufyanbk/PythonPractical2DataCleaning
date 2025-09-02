@@ -1,75 +1,135 @@
 -- =====================================================================
--- DSE vs PROD score parity (equality-only) using *_X1000 fields
--- Compares: dse_raw_score_X1000  vs  raw_score_X1000
--- Output:
---   [A] Overall match rate (exact equality)
---   [B] Example MATCHES (exact equality)
---   [C] Example MISMATCHES (exact inequality)
---   [D] Rounded comparison (scores rounded to whole numbers before compare)
+-- PER-CHANNEL (PORTFOLIO) SCORE PARITY — DSE vs PROD
+-- Table: project.dataset.45399569_dse_prod_scores
+-- Fields compared:
+--   DSE  : dse_raw_score_X1000
+--   PROD : raw_score_X1000
+-- Channels keyed via normalized portfolio_key (case-insensitive)
 -- =====================================================================
 
--- [STAGE] Pull the minimal columns into a temp table for readability.
+-- [A] Canonicalize channel/portfolio into a key (edit the IN() list if needed)
+CREATE TEMP TABLE tmp_src AS
+SELECT
+  s.*,
+  -- normalize the free-text Portfolio field to a compact key
+  CASE
+    WHEN UPPER(Portfolio) IN ('HSBC DIGITAL','FD DIGITAL','CMB DIGITAL') THEN UPPER(Portfolio)
+    ELSE 'OTHER'
+  END AS portfolio_key
+FROM `project.dataset.45399569_dse_prod_scores` AS s;
+
+-- [B] Build a slim base for parity checks (keeps later queries simple)
 CREATE TEMP TABLE base AS
 SELECT
   lifecycle_id,
   customer_id,
   event_received_at,
   decision,
+  portfolio_key,                            -- our channel
   dse_raw_score_X1000  AS dse_x1000,
   raw_score_X1000      AS prod_x1000
-FROM `project.dataset.45399569_dse_prod_scores`;  -- <-- adjust project/dataset if needed
+FROM tmp_src;
 
--- [A] OVERALL MATCH RATE (exact equality, no tolerance)
+-- [C] PER-CHANNEL MATCH RATES
+-- WHAT:
+--   For each portfolio_key (channel), show:
+--     - total_rows: all rows in that channel
+--     - comparable_rows: rows where both scores are non-null
+--     - exact_match_count / exact_match_rate_pct: dse_x1000 == prod_x1000
+--     - rounded_match_count / rounded_match_rate_pct: ROUND(dse_x1000) == ROUND(prod_x1000)
+-- HOW:
+--   COUNTIF + SAFE_DIVIDE (so divisions by zero are safe)
 SELECT
-  'OVERALL_MATCH_RATE' AS section,
+  portfolio_key AS channel,
+
   COUNT(*) AS total_rows,
+
   COUNTIF(dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL) AS comparable_rows,
-  COUNTIF(dse_x1000 = prod_x1000 AND dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL) AS match_count,
-  ROUND(100 * SAFE_DIVIDE(
-    COUNTIF(dse_x1000 = prod_x1000 AND dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL),
-    COUNTIF(dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL)
-  ), 2) AS match_rate_pct
-FROM base;
 
--- [B] MATCH EXAMPLES: rows where DSE and PROD scores are exactly equal
-SELECT
-  'MATCH_EXAMPLES' AS section,
-  lifecycle_id,
-  customer_id,
-  event_received_at,
-  decision,
-  dse_x1000 AS dse_raw_score_X1000,
-  prod_x1000 AS raw_score_X1000
-FROM base
-WHERE dse_x1000 = prod_x1000
-ORDER BY event_received_at DESC
-LIMIT 50;
+  -- exact equality on the ×1000 fields
+  COUNTIF(dse_x1000 = prod_x1000
+          AND dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL) AS exact_match_count,
+  ROUND(
+    100 * SAFE_DIVIDE(
+      COUNTIF(dse_x1000 = prod_x1000
+              AND dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL),
+      COUNTIF(dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL)
+    ), 2
+  ) AS exact_match_rate_pct,
 
--- [C] MISMATCH EXAMPLES: rows where DSE and PROD scores differ
-SELECT
-  'MISMATCH_EXAMPLES' AS section,
-  lifecycle_id,
-  customer_id,
-  event_received_at,
-  decision,
-  dse_x1000 AS dse_raw_score_X1000,
-  prod_x1000 AS raw_score_X1000,
-  (dse_x1000 - prod_x1000) AS diff_x1000
-FROM base
-WHERE dse_x1000 IS DISTINCT FROM prod_x1000
-ORDER BY ABS(dse_x1000 - prod_x1000) DESC, event_received_at DESC
-LIMIT 50;
-
--- [D] ROUNDED COMPARISON: both scores rounded to whole numbers before comparing
-SELECT
-  'ROUNDED_MATCH_RATE' AS section,
-  COUNT(*) AS total_rows,
-  COUNTIF(dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL) AS comparable_rows,
+  -- whole-number equality (round both sides first)
   COUNTIF(ROUND(dse_x1000) = ROUND(prod_x1000)
           AND dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL) AS rounded_match_count,
-  ROUND(100 * SAFE_DIVIDE(
-    COUNTIF(ROUND(dse_x1000) = ROUND(prod_x1000)
-            AND dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL),
-    COUNTIF(dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL)
-  ), 2) AS rounded_match_rate_pct
-FROM base;
+  ROUND(
+    100 * SAFE_DIVIDE(
+      COUNTIF(ROUND(dse_x1000) = ROUND(prod_x1000)
+              AND dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL),
+      COUNTIF(dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL)
+    ), 2
+  ) AS rounded_match_rate_pct
+
+FROM base
+GROUP BY channel
+ORDER BY rounded_match_rate_pct DESC, exact_match_rate_pct DESC, channel;
+
+-- [D] OPTIONAL: per-channel examples (uncomment if you want quick eyeballs)
+
+-- -- D1. Exact MATCH examples per channel (latest 25 per channel)
+-- SELECT * FROM (
+--   SELECT
+--     portfolio_key AS channel,
+--     lifecycle_id, customer_id, event_received_at, decision,
+--     dse_x1000 AS dse_raw_score_X1000,
+--     prod_x1000 AS raw_score_X1000,
+--     ROW_NUMBER() OVER (PARTITION BY portfolio_key ORDER BY event_received_at DESC) AS rn
+--   FROM base
+--   WHERE dse_x1000 = prod_x1000
+-- )
+-- WHERE rn <= 25
+-- ORDER BY channel, rn;
+
+-- -- D2. Exact MISMATCH examples per channel (largest diffs first, top 25 per channel)
+-- SELECT * FROM (
+--   SELECT
+--     portfolio_key AS channel,
+--     lifecycle_id, customer_id, event_received_at, decision,
+--     dse_x1000 AS dse_raw_score_X1000,
+--     prod_x1000 AS raw_score_X1000,
+--     (dse_x1000 - prod_x1000) AS diff_x1000,
+--     ROW_NUMBER() OVER (PARTITION BY portfolio_key ORDER BY ABS(dse_x1000 - prod_x1000) DESC, event_received_at DESC) AS rn
+--   FROM base
+--   WHERE dse_x1000 IS DISTINCT FROM prod_x1000
+-- )
+-- WHERE rn <= 25
+-- ORDER BY channel, rn;
+
+-- -- D3. Whole-number MATCH examples per channel (latest 25 per channel)
+-- SELECT * FROM (
+--   SELECT
+--     portfolio_key AS channel,
+--     lifecycle_id, customer_id, event_received_at, decision,
+--     dse_x1000, prod_x1000,
+--     ROUND(dse_x1000) AS dse_whole,
+--     ROUND(prod_x1000) AS prod_whole,
+--     ROW_NUMBER() OVER (PARTITION BY portfolio_key ORDER BY event_received_at DESC) AS rn
+--   FROM base
+--   WHERE ROUND(dse_x1000) = ROUND(prod_x1000)
+-- )
+-- WHERE rn <= 25
+-- ORDER BY channel, rn;
+
+-- -- D4. Whole-number MISMATCH examples per channel (top 25 per channel)
+-- SELECT * FROM (
+--   SELECT
+--     portfolio_key AS channel,
+--     lifecycle_id, customer_id, event_received_at, decision,
+--     dse_x1000, prod_x1000,
+--     ROUND(dse_x1000) AS dse_whole,
+--     ROUND(prod_x1000) AS prod_whole,
+--     (ROUND(dse_x1000) - ROUND(prod_x1000)) AS diff_whole,
+--     ROW_NUMBER() OVER (PARTITION BY portfolio_key ORDER BY ABS(ROUND(dse_x1000) - ROUND(prod_x1000)) DESC, event_received_at DESC) AS rn
+--   FROM base
+--   WHERE ROUND(dse_x1000) != ROUND(prod_x1000)
+-- )
+-- WHERE rn <= 25
+-- ORDER BY channel, rn;
