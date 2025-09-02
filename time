@@ -133,3 +133,17 @@ ORDER BY rounded_match_rate_pct DESC, exact_match_rate_pct DESC, channel;
 -- )
 -- WHERE rn <= 25
 -- ORDER BY channel, rn;
+
+-- How big are the differences? (X1000 units)
+SELECT
+  channel,
+  COUNT(*) AS rows,
+  ROUND(100 * SAFE_DIVIDE(COUNTIF(ABS(dse_x1000 - prod_x1000) <= 0.5), COUNT(*)), 2)  AS pct_within_0p5,
+  ROUND(100 * SAFE_DIVIDE(COUNTIF(ABS(dse_x1000 - prod_x1000) <= 1.0), COUNT(*)), 2)  AS pct_within_1,
+  ROUND(100 * SAFE_DIVIDE(COUNTIF(ABS(dse_x1000 - prod_x1000) <= 2.0), COUNT(*)), 2)  AS pct_within_2,
+  ROUND(100 * SAFE_DIVIDE(COUNTIF(ABS(dse_x1000 - prod_x1000) <= 5.0), COUNT(*)), 2)  AS pct_within_5,
+  ROUND(100 * SAFE_DIVIDE(COUNTIF(ABS(dse_x1000 - prod_x1000) >  5.0), COUNT(*)), 2)  AS pct_over_5
+FROM base
+WHERE dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL
+GROUP BY channel
+ORDER BY pct_within_1 DESC;
