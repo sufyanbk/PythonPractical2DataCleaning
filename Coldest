@@ -1,0 +1,132 @@
+[A] Per-channel exact match rate
+
+Shows exact score equality by channel across all rows in that channel.
+
+channel – grouping key (your normalized portfolio).
+
+total_rows – all rows in the channel (including rows where one score might be NULL).
+
+comparable_rows – rows where both dse_x1000 and prod_x1000 are non-NULL. This is the denominator for rates.
+
+exact_match_count – number of comparable rows where dse_x1000 = prod_x1000 bit-for-bit. This is strict float equality.
+
+exact_match_rate_pct – exact_match_count / comparable_rows * 100, rounded to 2 decimals. If comparable_rows=0, it returns NULL (thanks to SAFE_DIVIDE).
+
+
+How to read: This is the harshest possible test. Low values usually reflect tiny floating-point differences, not real model divergence.
+
+
+---
+
+[B1] Hourly match rate — all transactions
+
+Exact equality by channel + local hour on the full population.
+
+channel – as above.
+
+local_hour – 0–23, in London time.
+
+total_rows – all rows for that channel-hour.
+
+comparable_rows – rows in that channel-hour with both scores present.
+
+exact_match_count – exact matches in that channel-hour.
+
+exact_match_rate_pct – per-hour exact match % on comparable rows.
+
+
+How to read: Spot time-of-day effects. Dips at certain hours often track vendor latency, data freshness, or batch boundaries.
+
+
+---
+
+[B2] Hourly match rate — alerts only
+
+Same as B1, but restricted to transactions where either system raised an alert.
+
+channel – as above.
+
+local_hour – as above.
+
+total_alerts – number of alerted transactions (DSE or PROD or BOTH) in that channel-hour.
+
+comparable_alerts – alerted rows with both scores present.
+
+exact_match_alerts – alerted rows where scores are exactly equal.
+
+exact_match_rate_alerts_pct – exact match % among alerts only.
+
+
+How to read: Parity where it matters operationally—on cases that actually triggered reviews.
+
+
+---
+
+[C] Fraud-only match rate
+
+Exact equality restricted to known frauds.
+
+channel – as above.
+
+total_frauds – number of rows with FLAG_FRAUD=1 in the channel.
+
+comparable_frauds – fraud rows with both scores present.
+
+exact_match_frauds – fraud rows where scores are exactly equal.
+
+exact_match_rate_frauds_pct – exact match % on comparable fraud rows.
+
+
+How to read: “Do the models agree on the bad stuff?” Lower parity here merits priority investigation.
+
+
+---
+
+[D] Alert overlap breakdown (BOTH / DSE_ONLY / PROD_ONLY)
+
+Classifies each alerted row then summarizes by channel-hour.
+
+channel – as above.
+
+local_hour – as above.
+
+alerts_total – number of alerted rows in the channel-hour (the denominator for the percentages below).
+
+both_ct – count where both systems alerted (BOTH_ALERT=1).
+
+dse_only_ct – count where only DSE alerted (DSE_ONLY_ALERT=1).
+
+prod_only_ct – count where only PROD alerted (PROD_ONLY_ALERT=1).
+
+pct_both – % of alerts_total that were BOTH.
+
+pct_dse_only – % of alerts_total that were DSE_ONLY.
+
+pct_prod_only – % of alerts_total that were PROD_ONLY.
+
+
+How to read: A quick Venn diagram in numbers. High pct_dse_only or pct_prod_only means asymmetric alerting; investigate feature availability, thresholds, or timing.
+
+
+---
+
+[E] Score-difference diagnostics (how far apart)
+
+Shows how big the gaps are (in ×1000 units) for each channel, on rows where both scores exist.
+
+channel – as above.
+
+total_rows – here this equals comparable rows (query filters out NULLs in the WHERE clause).
+
+pct_within_0p5 – % of rows with |dse_x1000 − prod_x1000| ≤ 0.5. In original score units this is ≤ 0.0005.
+
+pct_within_1 – ≤ 1.0 in ×1000 space (≤ 0.001 original).
+
+pct_within_2 – ≤ 2.0 (≤ 0.002 original).
+
+pct_within_5 – ≤ 5.0 (≤ 0.005 original).
+
+pct_over_5 – > 5.0 (differences exceeding 0.005 original).
+
+
+How to read: If most rows fall within 1.0 or 2.0, your “low” exact match rate is just float jitter; big tails (>5) suggest genuine divergence windows.
