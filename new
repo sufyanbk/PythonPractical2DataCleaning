@@ -1,19 +1,42 @@
-SELECT
-  portfolio_key AS channel,
+-- =====================================================================
+-- DSE vs PROD SCORE PARITY — EXACT ONLY (RAW * 1000), PER CHANNEL
+-- Table: project.dataset.45399569_dse_prod_scores
+-- Compare:
+--   dse_x1000  := dse_raw_score * 1000
+--   prod_x1000 := raw_score     * 1000
+-- Output: For each channel, exact match count and % (bit-for-bit equality)
+-- =====================================================================
 
+-- 1) Base with channel key + derived ×1000 scores
+CREATE TEMP TABLE base AS
+SELECT
+  lifecycle_id,
+  customer_id,
+  event_received_at,
+  decision,
+  -- normalize your portfolio/channel label (tweak list as needed)
+  CASE
+    WHEN UPPER(Portfolio) IN ('HSBC DIGITAL','FD DIGITAL','CMB DIGITAL') THEN UPPER(Portfolio)
+    ELSE 'OTHER'
+  END AS channel,
+  (dse_raw_score * 1000.0) AS dse_x1000,
+  (raw_score     * 1000.0) AS prod_x1000
+FROM `project.dataset.45399569_dse_prod_scores`;  -- <-- set project/dataset
+
+-- 2) Exact match rate per channel (strict equality, no rounding/tolerance)
+SELECT
+  channel,
   COUNT(*) AS total_rows,
   COUNTIF(dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL) AS comparable_rows,
-
-  COUNTIF(CAST(dse_x1000 AS INT64) = CAST(prod_x1000 AS INT64)
-          AND dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL) AS int_match_count,
+  COUNTIF(dse_x1000 = prod_x1000
+          AND dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL) AS exact_match_count,
   ROUND(
     100 * SAFE_DIVIDE(
-      COUNTIF(CAST(dse_x1000 AS INT64) = CAST(prod_x1000 AS INT64)
+      COUNTIF(dse_x1000 = prod_x1000
               AND dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL),
       COUNTIF(dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL)
     ), 2
-  ) AS int_match_rate_pct
-
+  ) AS exact_match_rate_pct
 FROM base
 GROUP BY channel
-ORDER BY int_match_rate_pct DESC;
+ORDER BY exact_match_rate_pct DESC, channel;
