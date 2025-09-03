@@ -1,0 +1,10 @@
+Independently re-run the DSE simulation (same time period) to validate the results, with another person (Jata) taking it on.
+	•	Document each step of the simulation process (extraction, schema alignment, evaluation, joining with PROD) so the approach is transparent and reproducible.
+	•	Check model binaries and feature plans to confirm the only change between the two models was feature names — rule out other differences like sampling or seeds.
+	•	Add standard fraud metrics (VDR, FPR, and underlying counts) to the comparison tables to cross-check performance differences.
+	•	Start feature-level investigation:
+	•	Take transactions where PROD alerts but DSE does not.
+	•	For those, tag on DSE real-time features, SMJs, and map operators.
+	•	Compare with PROD’s Case Manager “explanation box” values.
+	•	Trace divergences back to feature definitions (data source, timestamp, scaling, etc.).
+	•	Develop a script to automate attaching DSE feature values to the mismatch set (currently not in place).
