@@ -1,0 +1,54 @@
+-- =========================================================
+-- ROUNDED MATCH RATE
+-- =========================================================
+-- Purpose:
+--   Rounds both DSE and PROD scaled scores to the nearest integer
+--   before comparison. This allows small decimal differences to
+--   still count as matches.
+-- Example:
+--   dse_x1000 = 555.5 → ROUND = 556
+--   prod_x1000 = 556.0 → ROUND = 556 → MATCH
+--   dse_x1000 = 777.49 → ROUND = 777
+--   prod_x1000 = 777.51 → ROUND = 778 → MISMATCH
+SELECT
+  channel,
+  COUNT(*) AS total_rows,
+  COUNTIF(dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL) AS comparable_rows,
+  COUNTIF(ROUND(dse_x1000) = ROUND(prod_x1000) AND dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL) AS rounded_match_count,
+  ROUND(
+    100 * SAFE_DIVIDE(
+      COUNTIF(ROUND(dse_x1000) = ROUND(prod_x1000) AND dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL),
+      COUNTIF(dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL)
+    ), 2
+  ) AS rounded_match_rate_pct
+FROM base
+GROUP BY channel
+ORDER BY rounded_match_rate_pct DESC, channel;
+
+
+-- =========================================================
+-- INTEGER TRUNCATION MATCH RATE
+-- =========================================================
+-- Purpose:
+--   Converts both DSE and PROD scaled scores to integers 
+--   (drops the decimal part entirely) before comparison.
+--   This checks whether both fall into the same integer “bucket.”
+-- Example:
+--   dse_x1000 = 777.7 → CAST = 777
+--   prod_x1000 = 777.1 → CAST = 777 → MATCH
+--   dse_x1000 = 555.9 → CAST = 555
+--   prod_x1000 = 556.2 → CAST = 556 → MISMATCH
+SELECT
+  channel,
+  COUNT(*) AS total_rows,
+  COUNTIF(dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL) AS comparable_rows,
+  COUNTIF(CAST(dse_x1000 AS INT64) = CAST(prod_x1000 AS INT64) AND dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL) AS integer_match_count,
+  ROUND(
+    100 * SAFE_DIVIDE(
+      COUNTIF(CAST(dse_x1000 AS INT64) = CAST(prod_x1000 AS INT64) AND dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL),
+      COUNTIF(dse_x1000 IS NOT NULL AND prod_x1000 IS NOT NULL)
+    ), 2
+  ) AS integer_match_rate_pct
+FROM base
+GROUP BY channel
+ORDER BY integer_match_rate_pct DESC, channel;
