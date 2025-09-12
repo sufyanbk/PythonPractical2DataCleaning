@@ -1,0 +1,134 @@
+DOFC — DSE Orchestrated Fair‑Compute (Text Version)
+====================================================
+
+Purpose
+-------
+Keep interactive work snappy, make heavy jobs predictable, and end after‑hours babysitting.
+
+Executive One‑Liner
+-------------------
+Isolate workloads, control admission, and instrument everything. Users get real ETAs and protected interactive capacity; heavy jobs finish within forecast without monopolising the cluster.
+
+ASCII Architecture Diagram
+--------------------------
++----------------------------------------------------------------------------------+
+|                          D S E   O R C H E S T R A T O R                         |
++----------------------------------------------------------------------------------+
+| 1) Submit Gateway | 2) Pre‑Flight Analyzer | 3) Policy Engine & Scheduler        |
+|    (UI/CLI/API)   |    (ETA + L/H check)   |   (QoS, DRF, quotas, auto‑queue)    |
++-------------------+------------------------+-------------------------------------+
+|                         Resource Partitions (Hard Floors)                        |
+|      [Interactive Pool — L] <---- L‑label jobs ----+                             |
+|        • 25–35% floor (business hours)             |                             |
+|        • warm executors, hot‑set cache             |      +--> [Critical Lane]*  |
+|        • notebook/KPI/light PySpark                |      |    (P0 only)         |
+|                                                    |      |                      |
+|      [Heavy Pool — H] <----------- H‑label jobs ---+------+                      |
+|        • plans/evals, large shuffles                                           |
+|        • executor ceilings, DRF fairness, polite preemption                     |
++----------------------------------------------------------------------------------+
+|                    Execution & Reliability | Observability & DX                  |
+|   Spark+AQE+skew, checkpoint & auto‑retry | Live Ops, per‑job timeline, logs     |
+|                                           | Actionable errors, post‑run report   |
++----------------------------------------------------------------------------------+
+* Critical Lane is optional, tiny, and time‑boxed for audited P0 emergencies.
+
+Problem → Solution Mapping
+--------------------------
+1) Long, unpredictable runtimes
+   • Problem: jobs run for hours/days; failures force full restarts; no ETA before run.
+   • Solution: Pre‑Flight ETA (p50/p90) and cost estimate; calendar‑aware auto‑queue; stage checkpointing with smart retry.
+   • Outcome: duration becomes known; failures recover without starting from scratch.
+
+2) User‑to‑user contention (notebooks crawl)
+   • Problem: one heavy plan can starve interactive work; no fairness or isolation.
+   • Solution: L/H resource pools with a guaranteed Interactive floor; DRF fairness; job executor ceilings; per‑user heavy concurrency cap (1).
+   • Outcome: interactive tasks stay responsive; heavy work proceeds without trampling others.
+
+3) Zero visibility & weak diagnostics
+   • Problem: opaque queues; misleading progress; cryptic errors; limited logs.
+   • Solution: Live Ops panel (load/queues/fair‑share), per‑job timelines with real ETA, unified log access, actionable error messages, post‑run performance report.
+   • Outcome: faster debugging, predictable planning, fewer escalations.
+
+Layer 1 — Intelligent Orchestration & Observability (What/Why)
+--------------------------------------------------------------
+• Submit Gateway (UI/CLI/API)
+  - Does: Builds a JobSpec, validates inputs, exposes priority & off‑peak scheduling.
+  - Solves: ad‑hoc starts and after‑hours babysitting via start‑time promise.
+
+• Pre‑Flight Analyzer (ETA + Risk)
+  - Does: 1–2% sample + plan inspection → ETA p50/p90, estimated shuffle GB; flags foot‑guns.
+  - Solves: unpredictable runtimes and wasteful runs before they begin.
+
+• Policy Engine & Scheduler (QoS + Auto‑Queue)
+  - Does: Enforces QoS (L/H, P0–P2), quotas, DRF fairness; calendar‑aware auto‑queue; preemption rules.
+  - Solves: contention, fairness, and “run at 19:00 automatically” need.
+
+• Observability Suite
+  - Does: Live Ops (load, queues, who’s hogging), per‑job timeline & ETA, unified logs, actionable errors, post‑run performance report.
+  - Solves: zero visibility; slow, guessy troubleshooting.
+
+Layer 2 — Resource Partitioning with L/H Classification (What/Why)
+------------------------------------------------------------------
+• Interactive Pool (L)
+  - Does: Reserves 25–35% cores/RAM 09:00–18:00; warm executors; hot‑dataset cache; max runtime ~45m.
+  - Solves: guarantees notebook/KPI/ad‑hoc responsiveness during the day.
+
+• Heavy Pool (H)
+  - Does: Runs model plans/evaluations; checkpointing on; executor ceilings; DRF fairness; polite preemption if Interactive SLOs breach.
+  - Solves: prevents heavy jobs from monopolising compute.
+
+• Critical Fast Lane (optional)
+  - Does: Tiny, time‑boxed pool for P0 emergencies with approval/audit.
+  - Solves: urgent fixes without destabilising the platform.
+
+• Honest L/H Classification
+  - Does: User picks L/H; Pre‑Flight can override mislabels (e.g., high shuffle → H).
+  - Solves: keeps heavy work in the right lane; protects Interactive.
+
+Layer 3 — Fairness & Anti‑Monopoly Controls (What/Why)
+------------------------------------------------------
+• DRF Fairness (CPU & memory)
+  - Does: Balances dominant resource usage across users/teams.
+  - Solves: a single user hoarding cluster capacity.
+
+• Per‑User Concurrency Cap (Heavy = 1)
+  - Does: Limits each user to one concurrent heavy job (team caps configurable).
+  - Solves: shotgun parallelism that blocks others.
+
+• Executor Ceilings per Job
+  - Does: Hard max executors and memory per heavy job derived from JobSpec.
+  - Solves: “one job to rule them all” monopolisation.
+
+• Polite Preemption with Checkpoints
+  - Does: If Interactive p95 latency > 5s for 2m, pause & checkpoint lowest‑priority heavy job; resume later.
+  - Solves: preserves Interactive SLOs without losing heavy progress.
+
+• Reservation Windows & Deadlines
+  - Does: Book heavy capacity for known big runs; earliest‑deadline‑first within priority band.
+  - Solves: end‑of‑month/model refresh spikes without chaos.
+
+JobSpec — Canonical Contract (for consistency)
+----------------------------------------------
+job_id, owner, team, label(L/H), priority(P0/P1/P2), deadline(optional),
+inputs(size/format/partitions), est_shuffle_gb, eta_p50/p90,
+pool(route), max_executors, mem_per_executor, retry_policy, checkpoint=true/false
+
+Submission Lifecycle (happy path)
+---------------------------------
+1) Submit → user sets priority or off‑peak start; gateway builds JobSpec.
+2) Pre‑Flight → ETA p50/p90 + risk flags; L/H override if mislabelled.
+3) Schedule → auto‑queue picks earliest SLO‑safe slot (e.g., 19:00); start‑time promise shown.
+4) Execute → in correct pool with ceilings; Spark uses AQE/skew mitigation.
+5) Recover → on failure, resume from last checkpoint with smart retry/backoff.
+6) Observe → Live Ops & per‑job timeline show progress & who’s hogging.
+7) Report → post‑run performance summary with optimisation hints.
+
+SLOs & User Promises
+--------------------
+• Interactive: p95 queue < 30s; p95 notebook cell latency < 5s (09:00–18:00).
+• Heavy: p95 start < 20m; ETA accuracy ≥ 75% within ±25%.
+• Reliability: checkpointed recovery success ≥ 90%; failed+aborted long jobs reduced by ~60%.
+
+Glossary (quick)\n---------\nL/H: Light/Heavy classification • DRF: Dominant Resource Fairness • AQE: Adaptive Query Execution • SLO: Service Level Objective • P0/P1/P2: Priority bands.
+
